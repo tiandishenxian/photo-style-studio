@@ -514,6 +514,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  position: relative;
 }
 
 .group-browser-header {
@@ -521,6 +522,13 @@ button {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  position: sticky;
+  top: -16px;
+  z-index: 12;
+  background: #ffffff;
+  margin-top: -16px;
+  padding: 20px 0 10px;
+  box-shadow: 0 1px 0 #f1f1f7;
 }
 
 .group-browser-actions {
