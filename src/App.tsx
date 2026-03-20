@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type WheelEvent as ReactWheelEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type UIEvent as ReactUIEvent,
+  type WheelEvent as ReactWheelEvent,
+} from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -62,6 +69,7 @@ type FrontendState = {
   archiveLogs: ArchiveLog[];
   libraries: LibraryEntry[];
   groupNotes: Record<string, string>;
+  groupViewPositions: Record<string, number>;
 };
 
 type ArchiveImportResult = {
@@ -447,6 +455,7 @@ function App() {
   const [tagLibrary, setTagLibrary] = useState<string[]>([]);
   const [libraries, setLibraries] = useState<LibraryEntry[]>([]);
   const [groupNotes, setGroupNotes] = useState<Record<string, string>>({});
+  const [groupViewPositions, setGroupViewPositions] = useState<Record<string, number>>({});
   const [searchArtist, setSearchArtist] = useState("");
   const [selectedArtist, setSelectedArtist] = useState<string | null>(null);
   const [expandedArtist, setExpandedArtist] = useState<string | null>(null);
@@ -483,9 +492,17 @@ function App() {
   const [pickingPaletteIndex, setPickingPaletteIndex] = useState<number | null>(null);
   const [paletteHint, setPaletteHint] = useState<string | null>(null);
   const [pickerPreview, setPickerPreview] = useState<PickerPreview | null>(null);
+  const [restorePrompt, setRestorePrompt] = useState<{
+    viewKey: string;
+    scrollTop: number;
+  } | null>(null);
   const colorInputRef = useRef<HTMLInputElement | null>(null);
   const viewerCardRef = useRef<HTMLDivElement | null>(null);
+  const mainBodyRef = useRef<HTMLDivElement | null>(null);
   const paletteHydrationRef = useRef<Set<string>>(new Set());
+  const groupScrollTopRef = useRef(0);
+  const restorePromptTimerRef = useRef<number | null>(null);
+  const pendingScrollSaveTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const bootstrap = async () => {
@@ -666,6 +683,17 @@ function App() {
     setMoveTargetGroupId("unassigned");
   }, [activeGroupId, currentArtist]);
 
+  useEffect(() => {
+    return () => {
+      if (restorePromptTimerRef.current !== null) {
+        window.clearTimeout(restorePromptTimerRef.current);
+      }
+      if (pendingScrollSaveTimerRef.current !== null) {
+        window.clearTimeout(pendingScrollSaveTimerRef.current);
+      }
+    };
+  }, []);
+
   const selectedPhoto = useMemo(
     () => visiblePhotos.find((photo) => photo.path === selectedPhotoPath) ?? null,
     [selectedPhotoPath, visiblePhotos],
@@ -842,6 +870,7 @@ function App() {
     () => buildGroupNoteKey(currentArtist, activeGroupId),
     [activeGroupId, currentArtist],
   );
+  const currentGroupViewKey = currentGroupNoteKey;
 
   const currentGroupNote = useMemo(() => {
     if (!currentGroupNoteKey) {
@@ -872,17 +901,103 @@ function App() {
   const showGroupWorkspace = workspaceView === "group";
   const selectedPhotoPalette = selectedPhoto ? buildPalette(selectedPhoto.palette) : [];
 
+  useEffect(() => {
+    if (restorePromptTimerRef.current !== null) {
+      window.clearTimeout(restorePromptTimerRef.current);
+      restorePromptTimerRef.current = null;
+    }
+
+    if (!showGroupWorkspace || !currentGroupViewKey) {
+      setRestorePrompt(null);
+      return;
+    }
+
+    const savedScrollTop = groupViewPositions[currentGroupViewKey] ?? 0;
+    groupScrollTopRef.current = 0;
+    if (mainBodyRef.current) {
+      mainBodyRef.current.scrollTop = 0;
+    }
+
+    if (savedScrollTop <= 0) {
+      setRestorePrompt(null);
+      return;
+    }
+
+    setRestorePrompt({
+      viewKey: currentGroupViewKey,
+      scrollTop: savedScrollTop,
+    });
+
+    restorePromptTimerRef.current = window.setTimeout(() => {
+      setRestorePrompt((previous) =>
+        previous?.viewKey === currentGroupViewKey ? null : previous,
+      );
+      restorePromptTimerRef.current = null;
+    }, 5000);
+
+    return () => {
+      if (restorePromptTimerRef.current !== null) {
+        window.clearTimeout(restorePromptTimerRef.current);
+        restorePromptTimerRef.current = null;
+      }
+    };
+  }, [currentGroupViewKey, showGroupWorkspace]);
+
+  useEffect(() => {
+    if (!showGroupWorkspace || !currentGroupViewKey) {
+      return;
+    }
+
+    return () => {
+      if (pendingScrollSaveTimerRef.current !== null) {
+        window.clearTimeout(pendingScrollSaveTimerRef.current);
+        pendingScrollSaveTimerRef.current = null;
+      }
+
+      const savedScrollTop = Math.round(groupScrollTopRef.current);
+      if (savedScrollTop > 0) {
+        void persistGroupViewPosition(currentGroupViewKey, savedScrollTop);
+      }
+    };
+  }, [currentGroupViewKey, showGroupWorkspace]);
+
   function applyState(state: FrontendState) {
     setGroups(state.groups);
     setPhotos(hydratePhotos(state.photos));
     setTagLibrary(state.tags);
     setLibraries(state.libraries);
     setGroupNotes(state.groupNotes ?? {});
+    setGroupViewPositions(state.groupViewPositions ?? {});
   }
 
   async function refreshFromBackend() {
     const state = await invoke<FrontendState>("load_app_state");
     applyState(state);
+  }
+
+  async function persistGroupViewPosition(viewKey: string, scrollTop: number) {
+    const normalizedScrollTop = Math.max(0, Math.round(scrollTop));
+    setGroupViewPositions((previous) => {
+      if (previous[viewKey] === normalizedScrollTop) {
+        return previous;
+      }
+
+      return {
+        ...previous,
+        [viewKey]: normalizedScrollTop,
+      };
+    });
+
+    try {
+      await invoke("save_group_view_position", {
+        viewKey,
+        scrollTop: normalizedScrollTop,
+      });
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : String(error ?? "保存浏览位置失败"),
+      );
+    }
   }
 
   async function handleImportDirectory() {
@@ -1025,6 +1140,18 @@ function App() {
           const next = { ...previous };
           delete next[noteKey];
           return next;
+        });
+        setGroupViewPositions((previous) => {
+          const next = { ...previous };
+          delete next[noteKey];
+          return next;
+        });
+        void invoke("delete_group_view_position", {
+          viewKey: noteKey,
+        }).catch((error) => {
+          setStatusMessage(
+            error instanceof Error ? error.message : String(error ?? "删除浏览位置失败"),
+          );
         });
       }
       setPhotos((previous) =>
@@ -1543,6 +1670,41 @@ function App() {
     container.scrollLeft += delta;
   }
 
+  function handleMainBodyScroll(event: ReactUIEvent<HTMLDivElement>) {
+    if (!showGroupWorkspace || !currentGroupViewKey) {
+      return;
+    }
+
+    const nextScrollTop = event.currentTarget.scrollTop;
+    groupScrollTopRef.current = nextScrollTop;
+
+    if (restorePrompt) {
+      setRestorePrompt(null);
+    }
+
+    if (pendingScrollSaveTimerRef.current !== null) {
+      window.clearTimeout(pendingScrollSaveTimerRef.current);
+    }
+
+    pendingScrollSaveTimerRef.current = window.setTimeout(() => {
+      void persistGroupViewPosition(currentGroupViewKey, nextScrollTop);
+      pendingScrollSaveTimerRef.current = null;
+    }, 480);
+  }
+
+  function continueFromSavedGroupPosition() {
+    if (!restorePrompt || !mainBodyRef.current) {
+      return;
+    }
+
+    mainBodyRef.current.scrollTo({
+      top: restorePrompt.scrollTop,
+      behavior: "smooth",
+    });
+    groupScrollTopRef.current = restorePrompt.scrollTop;
+    setRestorePrompt(null);
+  }
+
   return (
     <div className={`studio-shell ${dragActive ? "drag-active" : ""}`}>
       <aside className="studio-sidebar">
@@ -1741,7 +1903,29 @@ function App() {
           </div>
         </header>
 
-        <div className="main-body">
+        <div
+          className="main-body"
+          ref={mainBodyRef}
+          onScroll={handleMainBodyScroll}
+        >
+          {false && showGroupWorkspace && restorePrompt ? (
+            <div className="group-restore-toast" role="status" aria-live="polite">
+              <span>是否从上次浏览位置继续观看？</span>
+              <div className="group-restore-toast-actions">
+                <button type="button" onClick={() => setRestorePrompt(null)}>
+                  先不用
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={continueFromSavedGroupPosition}
+                >
+                  继续观看
+                </button>
+              </div>
+            </div>
+          ) : null}
+
           <div className="workspace-grid">
             {showGroupWorkspace ? (
               <section className="group-browser-column">
@@ -2184,6 +2368,20 @@ function App() {
               )}
             </aside>
           </div>
+
+          {showGroupWorkspace && restorePrompt ? (
+            <div className="group-restore-toast" role="status" aria-live="polite">
+              <span>是否从上次浏览位置继续观看？</span>
+              <div className="group-restore-toast-actions">
+                <button type="button" onClick={() => setRestorePrompt(null)}>
+                  先不用
+                </button>
+                <button type="button" className="primary" onClick={continueFromSavedGroupPosition}>
+                  继续观看
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           {showGroupWorkspace ? null : (
           <section className="filmstrip-section">

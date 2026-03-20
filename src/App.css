@@ -488,6 +488,7 @@ button {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  position: relative;
   padding: 16px;
   display: flex;
   flex-direction: column;
@@ -529,6 +530,51 @@ button {
   margin-top: -16px;
   padding: 20px 0 10px;
   box-shadow: 0 1px 0 #f1f1f7;
+}
+
+.group-restore-toast {
+  position: absolute;
+  top: 92px;
+  right: 22px;
+  width: min(340px, calc(100% - 44px));
+  padding: 12px 14px;
+  border: 1px solid rgba(91, 76, 240, 0.14);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 14px 30px rgba(36, 35, 59, 0.12);
+  z-index: 14;
+}
+
+.group-restore-toast span {
+  display: block;
+  color: #3e4158;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.group-restore-toast-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.group-restore-toast-actions button {
+  min-width: 88px;
+  height: 34px;
+  border: 1px solid #dedfeb;
+  border-radius: 10px;
+  background: #ffffff;
+  color: #676b82;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.group-restore-toast-actions button.primary {
+  border-color: transparent;
+  background: #5b4cf0;
+  color: #ffffff;
 }
 
 .group-browser-actions {

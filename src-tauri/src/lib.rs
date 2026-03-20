@@ -96,6 +96,8 @@ struct AppState {
     #[serde(default)]
     group_notes: HashMap<String, String>,
     #[serde(default)]
+    group_view_positions: HashMap<String, i64>,
+    #[serde(default)]
     photographer_aliases: HashMap<String, String>,
     libraries: Vec<StoredLibrary>,
     archive_logs: Vec<StoredArchiveLog>,
@@ -108,6 +110,7 @@ struct FrontendState {
     photos: Vec<StoredPhoto>,
     tags: Vec<String>,
     group_notes: HashMap<String, String>,
+    group_view_positions: HashMap<String, i64>,
     archive_logs: Vec<StoredArchiveLog>,
     libraries: Vec<StoredLibrary>,
 }
@@ -137,6 +140,13 @@ struct ImportArchiveResponse {
     target_dir: String,
     extracted_files: usize,
     created_new_photographer: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupViewPositionResponse {
+    view_key: String,
+    scroll_top: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -398,6 +408,16 @@ fn rename_photographer(
     }
     state.group_notes = next_notes;
 
+    let mut next_group_view_positions = HashMap::new();
+    for (key, value) in state.group_view_positions {
+        if let Some(rest) = key.strip_prefix(&format!("{old_name}::")) {
+            next_group_view_positions.insert(format!("{new_name}::{rest}"), value);
+        } else {
+            next_group_view_positions.insert(key, value);
+        }
+    }
+    state.group_view_positions = next_group_view_positions;
+
     for target in state.photographer_aliases.values_mut() {
         if *target == old_name {
             *target = new_name.clone();
@@ -420,6 +440,37 @@ fn extract_photo_palette(photo_path: String) -> Result<Vec<String>, String> {
     }
 
     Ok(extract_palette_from_image(&path).unwrap_or_else(fallback_palette))
+}
+
+#[tauri::command]
+fn save_group_view_position(
+    app: AppHandle,
+    view_key: String,
+    scroll_top: i64,
+) -> Result<GroupViewPositionResponse, String> {
+    let connection = open_database(&app)?;
+    connection
+        .execute(
+            "INSERT INTO group_view_positions (view_key, scroll_top)
+             VALUES (?1, ?2)
+             ON CONFLICT(view_key) DO UPDATE SET scroll_top = excluded.scroll_top",
+            params![view_key, scroll_top],
+        )
+        .map_err(|err| err.to_string())?;
+
+    Ok(GroupViewPositionResponse { view_key, scroll_top })
+}
+
+#[tauri::command]
+fn delete_group_view_position(app: AppHandle, view_key: String) -> Result<(), String> {
+    let connection = open_database(&app)?;
+    connection
+        .execute(
+            "DELETE FROM group_view_positions WHERE view_key = ?1",
+            params![view_key],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -565,6 +616,7 @@ fn build_frontend_state(state: AppState) -> Result<FrontendState, String> {
         photos,
         tags: known_tags,
         group_notes: state.group_notes,
+        group_view_positions: state.group_view_positions,
         archive_logs: state.archive_logs,
         libraries: state.libraries,
     })
@@ -933,6 +985,11 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 note_value TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS group_view_positions (
+                view_key TEXT PRIMARY KEY,
+                scroll_top INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS photographer_aliases (
                 alias TEXT PRIMARY KEY,
                 target_name TEXT NOT NULL
@@ -1067,6 +1124,15 @@ fn read_full_state(connection: &Connection) -> Result<AppState, String> {
         .collect::<Result<HashMap<_, _>, _>>()
         .map_err(|err| err.to_string())?;
 
+    let mut positions_statement = connection
+        .prepare("SELECT view_key, scroll_top FROM group_view_positions")
+        .map_err(|err| err.to_string())?;
+    let group_view_positions = positions_statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|err| err.to_string())?;
+
     let mut aliases_statement = connection
         .prepare("SELECT alias, target_name FROM photographer_aliases")
         .map_err(|err| err.to_string())?;
@@ -1121,6 +1187,7 @@ fn read_full_state(connection: &Connection) -> Result<AppState, String> {
         photo_metadata,
         tags,
         group_notes,
+        group_view_positions,
         photographer_aliases,
         libraries,
         archive_logs,
@@ -1168,6 +1235,15 @@ fn write_full_state(connection: &Connection, state: &AppState) -> Result<(), Str
             .map_err(|err| err.to_string())?;
     }
 
+    for (view_key, scroll_top) in &state.group_view_positions {
+        transaction
+            .execute(
+                "INSERT INTO group_view_positions (view_key, scroll_top) VALUES (?1, ?2)",
+                params![view_key, scroll_top],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+
     for (alias, target_name) in &state.photographer_aliases {
         transaction
             .execute(
@@ -1211,6 +1287,7 @@ fn clear_state_tables(transaction: &Transaction) -> Result<(), String> {
         "photo_metadata",
         "tags",
         "group_notes",
+        "group_view_positions",
         "photographer_aliases",
         "libraries",
         "archive_logs",
@@ -1322,7 +1399,9 @@ pub fn run() {
             import_archive,
             rename_photographer,
             extract_photo_palette,
-            export_group_photos
+            export_group_photos,
+            save_group_view_position,
+            delete_group_view_position
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
