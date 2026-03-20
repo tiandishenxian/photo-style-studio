@@ -3,16 +3,19 @@ use std::{
     fs::{self, File},
     io,
     path::{Component, Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
 use image::{DynamicImage, GenericImageView};
 use rfd::FileDialog;
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
 const APP_STATE_FILE: &str = "app_state.json";
+const APP_DB_FILE: &str = "app_state.sqlite3";
 const IMAGE_EXTENSIONS: [&str; 9] = ["jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff", "avif"];
 const DEFAULT_FALLBACK_PALETTE: [&str; 6] = [
     "#d9b08c",
@@ -465,21 +468,37 @@ fn build_frontend_state(state: AppState) -> Result<FrontendState, String> {
                 meta.palette.clone()
             };
 
-            photos.push(StoredPhoto {
-                path: normalized_path,
-                name,
-                origin_path,
-                photographer_name: library.photographer_name.clone(),
-                group_id: meta.group_id,
-                tags: meta.tags,
-                palette,
-                mood: meta.mood,
-                summary: meta.summary,
-            });
+            let modified_timestamp = fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+
+            photos.push((
+                modified_timestamp,
+                StoredPhoto {
+                    path: normalized_path,
+                    name,
+                    origin_path,
+                    photographer_name: library.photographer_name.clone(),
+                    group_id: meta.group_id,
+                    tags: meta.tags,
+                    palette,
+                    mood: meta.mood,
+                    summary: meta.summary,
+                },
+            ));
         }
     }
 
-    photos.sort_by(|left, right| left.path.cmp(&right.path));
+    photos.sort_by(|(left_modified, left_photo), (right_modified, right_photo)| {
+        right_modified
+            .cmp(left_modified)
+            .then_with(|| left_photo.path.cmp(&right_photo.path))
+    });
+
+    let photos: Vec<StoredPhoto> = photos.into_iter().map(|(_, photo)| photo).collect();
 
     let mut known_tags = state.tags;
     let mut seen_tags: HashSet<String> = known_tags.iter().cloned().collect();
@@ -809,26 +828,349 @@ fn resolve_alias_target(state: &AppState, photographer_name: &str) -> Option<Str
         .map(|library| library.photographer_name.clone())
 }
 
-fn state_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let app_data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
     fs::create_dir_all(&app_data_dir).map_err(|err| err.to_string())?;
-    Ok(app_data_dir.join(APP_STATE_FILE))
+    Ok(app_data_dir)
+}
+
+fn state_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join(APP_STATE_FILE))
+}
+
+fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join(APP_DB_FILE))
+}
+
+fn open_database(app: &AppHandle) -> Result<Connection, String> {
+    let path = database_path(app)?;
+    let connection = Connection::open(path).map_err(|err| err.to_string())?;
+    initialize_database(&connection)?;
+    migrate_json_state_if_needed(app, &connection)?;
+    Ok(connection)
+}
+
+fn initialize_database(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS groups (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                photographer_name TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS photo_metadata (
+                path TEXT PRIMARY KEY,
+                group_id TEXT,
+                tags_json TEXT NOT NULL,
+                palette_json TEXT NOT NULL,
+                mood TEXT NOT NULL,
+                summary TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tags (
+                name TEXT PRIMARY KEY
+            );
+
+            CREATE TABLE IF NOT EXISTS group_notes (
+                note_key TEXT PRIMARY KEY,
+                note_value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS photographer_aliases (
+                alias TEXT PRIMARY KEY,
+                target_name TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS libraries (
+                photographer_name TEXT PRIMARY KEY,
+                original_name TEXT NOT NULL,
+                directory TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS archive_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                photographer_name TEXT NOT NULL,
+                target_dir TEXT NOT NULL,
+                extracted_files INTEGER NOT NULL,
+                created_new_photographer INTEGER NOT NULL
+            );
+            ",
+        )
+        .map_err(|err| err.to_string())
+}
+
+fn migrate_json_state_if_needed(app: &AppHandle, connection: &Connection) -> Result<(), String> {
+    let already_migrated = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'json_migrated'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
+
+    if already_migrated.is_some() {
+        return Ok(());
+    }
+
+    let library_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM libraries", [], |row| row.get(0))
+        .map_err(|err| err.to_string())?;
+
+    if library_count == 0 {
+        let json_path = state_path(app)?;
+        if json_path.exists() {
+            let content = fs::read_to_string(&json_path).map_err(|err| err.to_string())?;
+            let state: AppState = serde_json::from_str(&content).map_err(|err| err.to_string())?;
+            write_full_state(connection, &state)?;
+        }
+    }
+
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('json_migrated', '1')",
+            [],
+        )
+        .map_err(|err| err.to_string())?;
+
+    Ok(())
 }
 
 fn load_state(app: &AppHandle) -> Result<AppState, String> {
-    let path = state_path(app)?;
-    if !path.exists() {
-        return Ok(AppState::default());
-    }
-
-    let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
-    serde_json::from_str(&content).map_err(|err| err.to_string())
+    let connection = open_database(app)?;
+    read_full_state(&connection)
 }
 
 fn save_state(app: &AppHandle, state: &AppState) -> Result<(), String> {
-    let path = state_path(app)?;
-    let content = serde_json::to_string_pretty(state).map_err(|err| err.to_string())?;
-    fs::write(path, content).map_err(|err| err.to_string())
+    let mut connection = open_database(app)?;
+    write_full_state(&mut connection, state)
+}
+
+fn read_full_state(connection: &Connection) -> Result<AppState, String> {
+    let mut groups_statement = connection
+        .prepare(
+            "SELECT id, name, description, photographer_name
+             FROM groups
+             ORDER BY photographer_name, name",
+        )
+        .map_err(|err| err.to_string())?;
+    let groups = groups_statement
+        .query_map([], |row| {
+            Ok(StoredGroup {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                photographer_name: row.get(3)?,
+            })
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    let mut metadata_statement = connection
+        .prepare(
+            "SELECT path, group_id, tags_json, palette_json, mood, summary
+             FROM photo_metadata",
+        )
+        .map_err(|err| err.to_string())?;
+    let photo_metadata = metadata_statement
+        .query_map([], |row| {
+            let tags_json: String = row.get(2)?;
+            let palette_json: String = row.get(3)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                StoredPhotoMeta {
+                    group_id: row.get(1)?,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    palette: serde_json::from_str(&palette_json).unwrap_or_default(),
+                    mood: row.get(4)?,
+                    summary: row.get(5)?,
+                },
+            ))
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    let mut tags_statement = connection
+        .prepare("SELECT name FROM tags ORDER BY name")
+        .map_err(|err| err.to_string())?;
+    let tags = tags_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    let mut notes_statement = connection
+        .prepare("SELECT note_key, note_value FROM group_notes")
+        .map_err(|err| err.to_string())?;
+    let group_notes = notes_statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    let mut aliases_statement = connection
+        .prepare("SELECT alias, target_name FROM photographer_aliases")
+        .map_err(|err| err.to_string())?;
+    let photographer_aliases = aliases_statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|err| err.to_string())?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    let mut libraries_statement = connection
+        .prepare(
+            "SELECT photographer_name, original_name, directory
+             FROM libraries
+             ORDER BY photographer_name",
+        )
+        .map_err(|err| err.to_string())?;
+    let libraries = libraries_statement
+        .query_map([], |row| {
+            Ok(StoredLibrary {
+                photographer_name: row.get(0)?,
+                original_name: row.get(1)?,
+                directory: row.get(2)?,
+            })
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    let mut logs_statement = connection
+        .prepare(
+            "SELECT photographer_name, target_dir, extracted_files, created_new_photographer
+             FROM archive_logs
+             ORDER BY id DESC
+             LIMIT 20",
+        )
+        .map_err(|err| err.to_string())?;
+    let archive_logs = logs_statement
+        .query_map([], |row| {
+            Ok(StoredArchiveLog {
+                photographer_name: row.get(0)?,
+                target_dir: row.get(1)?,
+                extracted_files: row.get(2)?,
+                created_new_photographer: row.get::<_, i64>(3)? != 0,
+            })
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+
+    Ok(AppState {
+        groups,
+        photo_metadata,
+        tags,
+        group_notes,
+        photographer_aliases,
+        libraries,
+        archive_logs,
+    })
+}
+
+fn write_full_state(connection: &Connection, state: &AppState) -> Result<(), String> {
+    let transaction = connection.unchecked_transaction().map_err(|err| err.to_string())?;
+    clear_state_tables(&transaction)?;
+
+    for group in &state.groups {
+        transaction
+            .execute(
+                "INSERT INTO groups (id, name, description, photographer_name)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![group.id, group.name, group.description, group.photographer_name],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+
+    for (path, meta) in &state.photo_metadata {
+        let tags_json = serde_json::to_string(&meta.tags).map_err(|err| err.to_string())?;
+        let palette_json = serde_json::to_string(&meta.palette).map_err(|err| err.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO photo_metadata (path, group_id, tags_json, palette_json, mood, summary)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![path, meta.group_id, tags_json, palette_json, meta.mood, meta.summary],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+
+    for tag in &state.tags {
+        transaction
+            .execute("INSERT INTO tags (name) VALUES (?1)", params![tag])
+            .map_err(|err| err.to_string())?;
+    }
+
+    for (key, value) in &state.group_notes {
+        transaction
+            .execute(
+                "INSERT INTO group_notes (note_key, note_value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+
+    for (alias, target_name) in &state.photographer_aliases {
+        transaction
+            .execute(
+                "INSERT INTO photographer_aliases (alias, target_name) VALUES (?1, ?2)",
+                params![alias, target_name],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+
+    for library in &state.libraries {
+        transaction
+            .execute(
+                "INSERT INTO libraries (photographer_name, original_name, directory)
+                 VALUES (?1, ?2, ?3)",
+                params![library.photographer_name, library.original_name, library.directory],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+
+    for log in &state.archive_logs {
+        transaction
+            .execute(
+                "INSERT INTO archive_logs (photographer_name, target_dir, extracted_files, created_new_photographer)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    log.photographer_name,
+                    log.target_dir,
+                    log.extracted_files as i64,
+                    if log.created_new_photographer { 1 } else { 0 }
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+
+    transaction.commit().map_err(|err| err.to_string())
+}
+
+fn clear_state_tables(transaction: &Transaction) -> Result<(), String> {
+    for table in [
+        "groups",
+        "photo_metadata",
+        "tags",
+        "group_notes",
+        "photographer_aliases",
+        "libraries",
+        "archive_logs",
+    ] {
+        transaction
+            .execute(&format!("DELETE FROM {table}"), [])
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 fn parse_photographer_name(file_stem: &str) -> Option<String> {

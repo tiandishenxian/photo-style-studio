@@ -900,19 +900,29 @@ button {
 .archive-import-choice {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px 14px;
+  justify-content: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
   border: 1px solid #e6e7f3;
   border-radius: 14px;
   background: #fafafe;
   color: #4a4d65;
   font-size: 15px;
   font-weight: 700;
+  cursor: pointer;
 }
 
 .archive-import-choice input {
+  width: 18px;
+  height: 18px;
+  min-width: 18px;
+  margin: 0;
   flex-shrink: 0;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  box-shadow: none;
+  accent-color: #5b4cf0;
 }
 
 .archive-import-choice span {
