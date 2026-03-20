@@ -25,3 +25,4 @@ serde_json = "1"
 rfd = "0.15"
 zip = "2"
 walkdir = "2"
+image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "jpeg", "png", "tiff", "webp"] }
