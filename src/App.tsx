@@ -16,6 +16,7 @@ import {
   Settings,
   Trash2,
   Upload,
+  Download,
 } from "lucide-react";
 import "./App.css";
 
@@ -68,6 +69,11 @@ type ArchiveImportResult = {
   targetDir: string;
   extractedFiles: number;
   createdNewPhotographer: boolean;
+};
+
+type ExportGroupPhotosResult = {
+  targetDir: string;
+  exportedFiles: number;
 };
 
 type ArchiveImportPreview = {
@@ -156,6 +162,7 @@ const TEXT = {
   dropReady: "松开鼠标即可导入当前 ZIP 压缩包。",
   importSuccessNew: "已创建并导入这个摄影师。",
   importSuccessMerge: "已合并到已有摄影师文件夹。",
+  exportSuccess: "分组导出完成",
   loading: "正在加载...",
   importing: "正在导入...",
   unsupportedArchive: "目前只支持 ZIP 压缩包。",
@@ -917,6 +924,27 @@ function App() {
     } catch (error) {
       setStatusMessage(
         error instanceof Error ? error.message : String(error ?? TEXT.importError),
+      );
+    }
+  }
+
+  async function handleExportGroup() {
+    if (visiblePhotos.length === 0) {
+      return;
+    }
+
+    try {
+      setStatusMessage("正在导出分组图片...");
+      const result = await invoke<ExportGroupPhotosResult>("export_group_photos", {
+        photoPaths: visiblePhotos.map((photo) => photo.path),
+        groupName: activeGroupName,
+      });
+      setStatusMessage(
+        `${TEXT.exportSuccess}：${result.exportedFiles} 张 -> ${result.targetDir}`,
+      );
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : String(error ?? "导出分组失败"),
       );
     }
   }
@@ -1723,6 +1751,15 @@ function App() {
                     <span>{visiblePhotos.length} 张图片</span>
                   </div>
                   <div className="group-browser-actions">
+                    <button
+                      type="button"
+                      className="move-group-button export-group-button"
+                      onClick={() => void handleExportGroup()}
+                      disabled={visiblePhotos.length === 0}
+                    >
+                      <Download size={14} />
+                      导出分组
+                    </button>
                     {selectedGroupPhotoPaths.length > 0 ? (
                       <button
                         type="button"

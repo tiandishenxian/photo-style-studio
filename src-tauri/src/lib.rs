@@ -139,6 +139,13 @@ struct ImportArchiveResponse {
     created_new_photographer: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportGroupPhotosResponse {
+    target_dir: String,
+    exported_files: usize,
+}
+
 #[tauri::command]
 fn load_app_state(app: AppHandle) -> Result<FrontendState, String> {
     let state = load_state(&app)?;
@@ -413,6 +420,48 @@ fn extract_photo_palette(photo_path: String) -> Result<Vec<String>, String> {
     }
 
     Ok(extract_palette_from_image(&path).unwrap_or_else(fallback_palette))
+}
+
+#[tauri::command]
+fn export_group_photos(
+    photo_paths: Vec<String>,
+    group_name: String,
+) -> Result<ExportGroupPhotosResponse, String> {
+    if photo_paths.is_empty() {
+        return Err("当前分组里没有可导出的图片。".to_string());
+    }
+
+    let target_dir = FileDialog::new()
+        .set_title(&format!("选择“{}”的导出文件夹", group_name))
+        .pick_folder()
+        .ok_or_else(|| "你取消了导出文件夹选择。".to_string())?;
+
+    fs::create_dir_all(&target_dir).map_err(|err| err.to_string())?;
+
+    let width = photo_paths.len().to_string().len().max(3);
+    let mut exported_files = 0usize;
+
+    for (index, photo_path) in photo_paths.iter().enumerate() {
+        let source_path = PathBuf::from(photo_path);
+        if !source_path.exists() {
+            continue;
+        }
+
+        let extension = source_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("jpg");
+
+        let target_path = target_dir.join(format!("{:0width$}.{}", index + 1, extension, width = width));
+        fs::copy(&source_path, &target_path).map_err(|err| err.to_string())?;
+        exported_files += 1;
+    }
+
+    Ok(ExportGroupPhotosResponse {
+        target_dir: normalize_path_string(&target_dir.to_string_lossy()),
+        exported_files,
+    })
 }
 
 fn build_frontend_state(state: AppState) -> Result<FrontendState, String> {
@@ -1272,7 +1321,8 @@ pub fn run() {
             preview_archive_import,
             import_archive,
             rename_photographer,
-            extract_photo_palette
+            extract_photo_palette,
+            export_group_photos
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

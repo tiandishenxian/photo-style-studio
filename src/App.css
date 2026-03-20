@@ -546,6 +546,17 @@ button {
   background: #f8f7ff;
 }
 
+.export-group-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.export-group-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .group-browser-title {
   display: flex;
   align-items: baseline;
