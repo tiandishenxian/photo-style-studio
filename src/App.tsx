@@ -1,4 +1,4 @@
-import {
+﻿import {
   useEffect,
   useMemo,
   useRef,
@@ -7,6 +7,7 @@ import {
   type WheelEvent as ReactWheelEvent,
 } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ChevronDown,
@@ -21,6 +22,7 @@ import {
   RotateCcw,
   Search,
   Settings,
+  Star,
   Trash2,
   Upload,
   Download,
@@ -37,6 +39,7 @@ type PhotoItem = {
   palette: string[];
   mood: string;
   summary: string;
+  starred: boolean;
   previewSrc: string;
 };
 
@@ -82,6 +85,19 @@ type ArchiveImportResult = {
 type ExportGroupPhotosResult = {
   targetDir: string;
   exportedFiles: number;
+};
+
+type DedupeProgress = {
+  processed: number;
+  total: number;
+  duplicatesFound: number;
+  completed: boolean;
+};
+
+type DedupePhotosResult = {
+  duplicatesFound: number;
+  hiddenFiles: number;
+  state: FrontendState;
 };
 
 type ArchiveImportPreview = {
@@ -492,6 +508,8 @@ function App() {
   const [pickingPaletteIndex, setPickingPaletteIndex] = useState<number | null>(null);
   const [paletteHint, setPaletteHint] = useState<string | null>(null);
   const [pickerPreview, setPickerPreview] = useState<PickerPreview | null>(null);
+  const [dedupeProgress, setDedupeProgress] = useState<DedupeProgress | null>(null);
+  const [dedupeRunning, setDedupeRunning] = useState(false);
   const [restorePrompt, setRestorePrompt] = useState<{
     viewKey: string;
     scrollTop: number;
@@ -562,6 +580,25 @@ function App() {
 
     return () => {
       active = false;
+      cleanup?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cleanup: (() => void) | undefined;
+
+    void listen<DedupeProgress>("dedupe-progress", (event) => {
+      setDedupeProgress(event.payload);
+      if (event.payload.completed) {
+        window.setTimeout(() => {
+          setDedupeProgress((current) => (current?.completed ? null : current));
+        }, 1800);
+      }
+    }).then((unlisten) => {
+      cleanup = unlisten;
+    });
+
+    return () => {
       cleanup?.();
     };
   }, []);
@@ -649,7 +686,16 @@ function App() {
       return [];
     }
 
-    return photos.filter((photo) => photo.photographerName === currentArtist);
+    return photos
+      .filter((photo) => photo.photographerName === currentArtist)
+      .map((photo, index) => ({ photo, index }))
+      .sort((left, right) => {
+        if (left.photo.starred !== right.photo.starred) {
+          return left.photo.starred ? -1 : 1;
+        }
+        return left.index - right.index;
+      })
+      .map(({ photo }) => photo);
   }, [currentArtist, photos]);
 
   const visiblePhotos = useMemo(() => {
@@ -1064,6 +1110,41 @@ function App() {
     }
   }
 
+  async function handleDedupeCurrentGroup() {
+    if (visiblePhotos.length < 2 || dedupeRunning) {
+      return;
+    }
+
+    try {
+      setDedupeRunning(true);
+      setDedupeProgress({
+        processed: 0,
+        total: visiblePhotos.length,
+        duplicatesFound: 0,
+        completed: false,
+      });
+
+      const result = await invoke<DedupePhotosResult>("dedupe_photos_by_content", {
+        photoPaths: visiblePhotos.map((photo) => photo.path),
+      });
+
+      applyState(result.state);
+      setSelectedGroupPhotoPaths([]);
+      setStatusMessage(
+        result.hiddenFiles > 0
+          ? `一键去重完成，已隐藏 ${result.hiddenFiles} 张重复图片`
+          : "一键去重完成，没有发现重复图片",
+      );
+    } catch (error) {
+      setDedupeProgress(null);
+      setStatusMessage(
+        error instanceof Error ? error.message : String(error ?? "一键去重失败"),
+      );
+    } finally {
+      setDedupeRunning(false);
+    }
+  }
+
   function openCreateGroupDialog(photographerName: string) {
     setCreateGroupArtist(photographerName);
     setNewGroupName("");
@@ -1232,6 +1313,14 @@ function App() {
     setPhotos((previous) =>
       previous.map((photo) =>
         photo.path === selectedPhoto.path ? { ...photo, groupId } : photo,
+      ),
+    );
+  }
+
+  function togglePhotoStar(path: string) {
+    setPhotos((previous) =>
+      previous.map((photo) =>
+        photo.path === path ? { ...photo, starred: !photo.starred } : photo,
       ),
     );
   }
@@ -1937,6 +2026,14 @@ function App() {
                   <div className="group-browser-actions">
                     <button
                       type="button"
+                      className="move-group-button"
+                      onClick={() => void handleDedupeCurrentGroup()}
+                      disabled={visiblePhotos.length < 2 || dedupeRunning}
+                    >
+                      {dedupeRunning ? "正在去重..." : "一键去重"}
+                    </button>
+                    <button
+                      type="button"
                       className="move-group-button export-group-button"
                       onClick={() => void handleExportGroup()}
                       disabled={visiblePhotos.length === 0}
@@ -1973,6 +2070,25 @@ function App() {
                   </div>
                 </div>
 
+                {dedupeProgress ? (
+                  <div className="dedupe-progress">
+                    <div className="dedupe-progress-meta">
+                      <span>{dedupeRunning ? "正在按图片内容去重..." : "去重完成"}</span>
+                      <span>
+                        {dedupeProgress.processed} / {dedupeProgress.total} · 重复 {dedupeProgress.duplicatesFound}
+                      </span>
+                    </div>
+                    <div className="dedupe-progress-track">
+                      <div
+                        className="dedupe-progress-bar"
+                        style={{
+                          width: `${Math.round((dedupeProgress.processed / Math.max(dedupeProgress.total, 1)) * 100)}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                ) : null}
+
                 {visiblePhotos.length > 0 ? (
                   <div className={`group-browser-grid ${thumbnailScale}`}>
                     {visiblePhotos.map((photo) => (
@@ -1988,6 +2104,18 @@ function App() {
                           setWorkspaceView("detail");
                         }}
                       >
+                        <button
+                          type="button"
+                          className={`photo-star-button ${photo.starred ? "active" : ""}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            togglePhotoStar(photo.path);
+                          }}
+                          onPointerDown={(event) => event.stopPropagation()}
+                          aria-label={photo.starred ? "取消星标" : "标记星标"}
+                        >
+                          <Star size={14} fill={photo.starred ? "currentColor" : "none"} />
+                        </button>
                         <span
                           className={`group-browser-check ${
                             selectedGroupPhotoPaths.length > 0 ? "visible" : ""
@@ -2064,6 +2192,14 @@ function App() {
 
                 <div className="viewer-toolbar-right">
                   <div className="viewer-meta">
+                    <button
+                      type="button"
+                      className={`viewer-star-button ${selectedPhoto?.starred ? "active" : ""}`}
+                      onClick={() => selectedPhoto && togglePhotoStar(selectedPhoto.path)}
+                      aria-label={selectedPhoto?.starred ? "取消星标" : "标记星标"}
+                    >
+                      <Star size={14} fill={selectedPhoto?.starred ? "currentColor" : "none"} />
+                    </button>
                     <span>
                       {imageMetrics
                         ? `${imageMetrics.width} x ${imageMetrics.height}`

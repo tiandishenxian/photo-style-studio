@@ -1,6 +1,8 @@
 use std::{
+    collections::hash_map::DefaultHasher,
     collections::{HashMap, HashSet},
     fs::{self, File},
+    hash::{Hash, Hasher},
     io,
     path::{Component, Path, PathBuf},
     time::UNIX_EPOCH,
@@ -10,7 +12,7 @@ use image::{DynamicImage, GenericImageView};
 use rfd::FileDialog;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
@@ -51,6 +53,12 @@ struct StoredPhotoMeta {
     mood: String,
     #[serde(default)]
     summary: String,
+    #[serde(default)]
+    starred: bool,
+    #[serde(default)]
+    content_hash: Option<String>,
+    #[serde(default)]
+    hidden_duplicate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +74,8 @@ struct StoredPhoto {
     mood: String,
     #[serde(default)]
     summary: String,
+    #[serde(default)]
+    starred: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +166,23 @@ struct ExportGroupPhotosResponse {
     exported_files: usize,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DedupeProgressPayload {
+    processed: usize,
+    total: usize,
+    duplicates_found: usize,
+    completed: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DedupePhotosResponse {
+    duplicates_found: usize,
+    hidden_files: usize,
+    state: FrontendState,
+}
+
 #[tauri::command]
 fn load_app_state(app: AppHandle) -> Result<FrontendState, String> {
     let state = load_state(&app)?;
@@ -168,22 +195,32 @@ fn save_app_state(app: AppHandle, payload: SaveStatePayload) -> Result<(), Strin
     state.groups = payload.groups;
     state.tags = payload.tags;
     state.group_notes = payload.group_notes;
-    state.photo_metadata = payload
-        .photos
-        .into_iter()
-        .map(|photo| {
-            (
-                normalize_path_string(&photo.path),
-                StoredPhotoMeta {
-                    group_id: photo.group_id,
-                    tags: photo.tags,
-                    palette: photo.palette,
-                    mood: photo.mood,
-                    summary: photo.summary,
-                },
-            )
-        })
-        .collect();
+    let mut next_metadata = state.photo_metadata.clone();
+    for photo in payload.photos {
+        let normalized_path = normalize_path_string(&photo.path);
+        let previous_meta = next_metadata.get(&normalized_path).cloned();
+        let previous_content_hash = previous_meta
+            .as_ref()
+            .and_then(|meta| meta.content_hash.clone());
+        let previous_hidden_duplicate = previous_meta
+            .as_ref()
+            .map(|meta| meta.hidden_duplicate)
+            .unwrap_or(false);
+        next_metadata.insert(
+            normalized_path,
+            StoredPhotoMeta {
+                group_id: photo.group_id,
+                tags: photo.tags,
+                palette: photo.palette,
+                mood: photo.mood,
+                summary: photo.summary,
+                starred: photo.starred,
+                content_hash: previous_content_hash,
+                hidden_duplicate: previous_hidden_duplicate,
+            },
+        );
+    }
+    state.photo_metadata = next_metadata;
     save_state(&app, &state)
 }
 
@@ -515,6 +552,80 @@ fn export_group_photos(
     })
 }
 
+#[tauri::command]
+fn dedupe_photos_by_content(
+    app: AppHandle,
+    photo_paths: Vec<String>,
+) -> Result<DedupePhotosResponse, String> {
+    if photo_paths.len() < 2 {
+        return Ok(DedupePhotosResponse {
+            duplicates_found: 0,
+            hidden_files: 0,
+            state: build_frontend_state(load_state(&app)?)?,
+        });
+    }
+
+    let mut state = load_state(&app)?;
+    let total = photo_paths.len();
+    let mut processed = 0usize;
+    let mut duplicates_found = 0usize;
+    let mut seen_hashes: HashMap<String, String> = HashMap::new();
+
+    for path in &photo_paths {
+        let normalized_path = normalize_path_string(path);
+        let meta = state
+            .photo_metadata
+            .entry(normalized_path.clone())
+            .or_insert_with(|| default_photo_meta(&normalized_path));
+
+        let hash = match meta.content_hash.clone() {
+            Some(existing) if !existing.trim().is_empty() => existing,
+            _ => {
+                let computed = compute_content_hash(Path::new(&normalized_path))?;
+                meta.content_hash = Some(computed.clone());
+                computed
+            }
+        };
+
+        if seen_hashes.contains_key(&hash) {
+            meta.hidden_duplicate = true;
+            duplicates_found += 1;
+        } else {
+            meta.hidden_duplicate = false;
+            seen_hashes.insert(hash, normalized_path.clone());
+        }
+
+        processed += 1;
+        let _ = app.emit(
+            "dedupe-progress",
+            DedupeProgressPayload {
+                processed,
+                total,
+                duplicates_found,
+                completed: false,
+            },
+        );
+    }
+
+    save_state(&app, &state)?;
+    let frontend_state = build_frontend_state(load_state(&app)?)?;
+    let _ = app.emit(
+        "dedupe-progress",
+        DedupeProgressPayload {
+            processed: total,
+            total,
+            duplicates_found,
+            completed: true,
+        },
+    );
+
+    Ok(DedupePhotosResponse {
+        duplicates_found,
+        hidden_files: duplicates_found,
+        state: frontend_state,
+    })
+}
+
 fn build_frontend_state(state: AppState) -> Result<FrontendState, String> {
     let mut state = state;
     for library in &mut state.libraries {
@@ -561,6 +672,9 @@ fn build_frontend_state(state: AppState) -> Result<FrontendState, String> {
                 .get(&normalized_path)
                 .cloned()
                 .unwrap_or_else(|| default_photo_meta(&normalized_path));
+        if meta.hidden_duplicate && !meta.starred {
+            continue;
+        }
             let palette = if meta.palette.is_empty() || looks_like_placeholder_palette(&meta.palette)
             {
                 Vec::new()
@@ -587,6 +701,7 @@ fn build_frontend_state(state: AppState) -> Result<FrontendState, String> {
                     palette,
                     mood: meta.mood,
                     summary: meta.summary,
+                    starred: meta.starred,
                 },
             ));
         }
@@ -660,6 +775,9 @@ fn default_photo_meta(seed: &str) -> StoredPhotoMeta {
         palette: Vec::new(),
         mood: moods[mood_index].to_string(),
         summary: String::new(),
+        starred: false,
+        content_hash: None,
+        hidden_duplicate: false,
     }
 }
 
@@ -668,6 +786,14 @@ fn fallback_palette() -> Vec<String> {
         .iter()
         .map(|value| value.to_string())
         .collect()
+}
+
+fn compute_content_hash(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|err| err.to_string())?;
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let hash = hasher.finish();
+    Ok(format!("{:016x}-{}", hash, bytes.len()))
 }
 
 fn looks_like_placeholder_palette(palette: &[String]) -> bool {
@@ -973,7 +1099,10 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 tags_json TEXT NOT NULL,
                 palette_json TEXT NOT NULL,
                 mood TEXT NOT NULL,
-                summary TEXT NOT NULL
+                summary TEXT NOT NULL,
+                starred INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT,
+                hidden_duplicate INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS tags (
@@ -1010,7 +1139,22 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             );
             ",
         )
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+
+    let _ = connection.execute(
+        "ALTER TABLE photo_metadata ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE photo_metadata ADD COLUMN content_hash TEXT",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE photo_metadata ADD COLUMN hidden_duplicate INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
+    Ok(())
 }
 
 fn migrate_json_state_if_needed(app: &AppHandle, connection: &Connection) -> Result<(), String> {
@@ -1083,7 +1227,7 @@ fn read_full_state(connection: &Connection) -> Result<AppState, String> {
 
     let mut metadata_statement = connection
         .prepare(
-            "SELECT path, group_id, tags_json, palette_json, mood, summary
+            "SELECT path, group_id, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate
              FROM photo_metadata",
         )
         .map_err(|err| err.to_string())?;
@@ -1099,6 +1243,9 @@ fn read_full_state(connection: &Connection) -> Result<AppState, String> {
                     palette: serde_json::from_str(&palette_json).unwrap_or_default(),
                     mood: row.get(4)?,
                     summary: row.get(5)?,
+                    starred: row.get::<_, i64>(6).unwrap_or(0) != 0,
+                    content_hash: row.get(7).ok(),
+                    hidden_duplicate: row.get::<_, i64>(8).unwrap_or(0) != 0,
                 },
             ))
         })
@@ -1213,9 +1360,19 @@ fn write_full_state(connection: &Connection, state: &AppState) -> Result<(), Str
         let palette_json = serde_json::to_string(&meta.palette).map_err(|err| err.to_string())?;
         transaction
             .execute(
-                "INSERT INTO photo_metadata (path, group_id, tags_json, palette_json, mood, summary)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![path, meta.group_id, tags_json, palette_json, meta.mood, meta.summary],
+                "INSERT INTO photo_metadata (path, group_id, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    path,
+                    meta.group_id,
+                    tags_json,
+                    palette_json,
+                    meta.mood,
+                    meta.summary,
+                    if meta.starred { 1 } else { 0 },
+                    meta.content_hash,
+                    if meta.hidden_duplicate { 1 } else { 0 }
+                ],
             )
             .map_err(|err| err.to_string())?;
     }
@@ -1399,6 +1556,7 @@ pub fn run() {
             import_archive,
             rename_photographer,
             extract_photo_palette,
+            dedupe_photos_by_content,
             export_group_photos,
             save_group_view_position,
             delete_group_view_position
