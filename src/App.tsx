@@ -139,6 +139,14 @@ type ImageMetrics = {
   height: number;
 };
 
+type HistogramData = {
+  red: number[];
+  green: number[];
+  blue: number[];
+  luminance: number[];
+  maxValue: number;
+};
+
 type PickerPreview = {
   left: number;
   top: number;
@@ -173,6 +181,7 @@ const TEXT = {
   chooseImageHint: "右侧会显示色卡、分组、标签和总结。",
   filmstrip: "胶片轴",
   palette: "PALETTE",
+  histogram: "HISTOGRAM",
   currentGroup: "GROUP",
   tags: "TAGS",
   summary: "SUMMARY",
@@ -202,6 +211,8 @@ const TEXT = {
   emptyPalette: "选择图片后显示色卡",
   paletteLoading: "色卡加载中...",
   paletteEmpty: "还没有提取到色卡",
+  histogramLoading: "直方图加载中...",
+  histogramEmpty: "选择图片后显示直方图",
   copiedValue: "已复制",
 };
 
@@ -360,6 +371,97 @@ async function buildPaletteOverlay(
   return overlayCanvas.toDataURL("image/png");
 }
 
+async function buildHistogramData(imageSrc: string): Promise<HistogramData | null> {
+  const image = new Image();
+  image.crossOrigin = "anonymous";
+
+  const loaded = await new Promise<boolean>((resolve) => {
+    image.onload = () => resolve(true);
+    image.onerror = () => resolve(false);
+    image.src = imageSrc;
+  });
+
+  if (!loaded) {
+    return null;
+  }
+
+  const naturalWidth = image.naturalWidth || image.width;
+  const naturalHeight = image.naturalHeight || image.height;
+  if (!naturalWidth || !naturalHeight) {
+    return null;
+  }
+
+  const longestEdge = Math.max(naturalWidth, naturalHeight);
+  const scale = longestEdge > 320 ? 320 / longestEdge : 1;
+  const width = Math.max(1, Math.round(naturalWidth * scale));
+  const height = Math.max(1, Math.round(naturalHeight * scale));
+  const binCount = 64;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    return null;
+  }
+
+  context.drawImage(image, 0, 0, width, height);
+  const pixels = context.getImageData(0, 0, width, height).data;
+  const red = Array.from({ length: binCount }, () => 0);
+  const green = Array.from({ length: binCount }, () => 0);
+  const blue = Array.from({ length: binCount }, () => 0);
+  const luminance = Array.from({ length: binCount }, () => 0);
+
+  for (let index = 0; index < pixels.length; index += 4) {
+    const alpha = pixels[index + 3];
+    if (alpha < 8) {
+      continue;
+    }
+
+    const currentRed = pixels[index];
+    const currentGreen = pixels[index + 1];
+    const currentBlue = pixels[index + 2];
+    const currentLuminance = Math.round(
+      0.2126 * currentRed + 0.7152 * currentGreen + 0.0722 * currentBlue,
+    );
+
+    red[Math.min(binCount - 1, Math.floor((currentRed / 256) * binCount))] += 1;
+    green[Math.min(binCount - 1, Math.floor((currentGreen / 256) * binCount))] += 1;
+    blue[Math.min(binCount - 1, Math.floor((currentBlue / 256) * binCount))] += 1;
+    luminance[Math.min(binCount - 1, Math.floor((currentLuminance / 256) * binCount))] += 1;
+  }
+
+  const maxValue = Math.max(
+    1,
+    ...red,
+    ...green,
+    ...blue,
+    ...luminance,
+  );
+
+  return {
+    red,
+    green,
+    blue,
+    luminance,
+    maxValue,
+  };
+}
+
+function buildHistogramPoints(bins: number[], maxValue: number) {
+  if (bins.length === 0 || maxValue <= 0) {
+    return "0,100 100,100";
+  }
+
+  return bins
+    .map((value, index) => {
+      const x = bins.length === 1 ? 0 : (index / (bins.length - 1)) * 100;
+      const y = 100 - (value / maxValue) * 100;
+      return `${x.toFixed(2)},${Math.max(0, Math.min(100, y)).toFixed(2)}`;
+    })
+    .join(" ");
+}
+
 async function sampleImageColor(
   imageSrc: string,
   naturalWidth: number,
@@ -504,6 +606,8 @@ function App() {
   const [hydrated, setHydrated] = useState(false);
   const [copiedPaletteValue, setCopiedPaletteValue] = useState<string | null>(null);
   const [imageMetrics, setImageMetrics] = useState<ImageMetrics | null>(null);
+  const [histogramData, setHistogramData] = useState<HistogramData | null>(null);
+  const [histogramLoadingPath, setHistogramLoadingPath] = useState<string | null>(null);
   const [activePaletteTone, setActivePaletteTone] = useState<string | null>(null);
   const [paletteOverlaySrc, setPaletteOverlaySrc] = useState<string | null>(null);
   const [paletteLoadingPath, setPaletteLoadingPath] = useState<string | null>(null);
@@ -958,6 +1062,14 @@ function App() {
 
   const showGroupWorkspace = workspaceView === "group";
   const selectedPhotoPalette = selectedPhoto ? buildPalette(selectedPhoto.palette) : [];
+  const selectedPhotoHistogramPoints = histogramData
+    ? {
+        luminance: buildHistogramPoints(histogramData.luminance, histogramData.maxValue),
+        red: buildHistogramPoints(histogramData.red, histogramData.maxValue),
+        green: buildHistogramPoints(histogramData.green, histogramData.maxValue),
+        blue: buildHistogramPoints(histogramData.blue, histogramData.maxValue),
+      }
+    : null;
 
   function returnToGroupView() {
     const savedScrollTop = currentGroupViewKey ? groupViewPositions[currentGroupViewKey] ?? 0 : 0;
@@ -1033,6 +1145,41 @@ function App() {
       block: "nearest",
     });
   }, [selectedPhotoPath, workspaceView]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (workspaceView !== "detail" || !selectedPhoto) {
+      setHistogramData(null);
+      setHistogramLoadingPath(null);
+      return;
+    }
+
+    setHistogramLoadingPath(selectedPhoto.path);
+    setHistogramData(null);
+
+    void buildHistogramData(selectedPhoto.previewSrc)
+      .then((data) => {
+        if (cancelled) {
+          return;
+        }
+
+        setHistogramData(data);
+      })
+      .finally(() => {
+        if (cancelled) {
+          return;
+        }
+
+        setHistogramLoadingPath((current) =>
+          current === selectedPhoto.path ? null : current,
+        );
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedPhoto, workspaceView]);
 
   useEffect(() => {
     if (!showGroupWorkspace || !currentGroupViewKey) {
@@ -2094,7 +2241,7 @@ function App() {
             </div>
           ) : null}
 
-          <div className="workspace-grid">
+          <div className={`workspace-grid ${showGroupWorkspace ? "" : "detail-workspace-grid"}`}>
             {showGroupWorkspace ? (
               <section className="group-browser-column">
                 <div className="group-browser-header">
@@ -2234,102 +2381,175 @@ function App() {
                 )}
               </section>
             ) : (
-            <section className="viewer-column">
-              <div
-                className={`viewer-card ${pickingPaletteIndex !== null ? "picking" : ""}`}
-                ref={viewerCardRef}
-                onClick={handleViewerPick}
-                onMouseMove={handleViewerPickMove}
-                onMouseLeave={handleViewerPickLeave}
-                onContextMenu={handleViewerPickCancel}
-              >
-                {selectedPhoto ? (
-                  <>
-                    <img
-                      src={selectedPhoto.previewSrc}
-                      alt={selectedPhoto.name}
-                      className="viewer-image"
-                    />
-                    {paletteOverlaySrc ? (
-                      <img
-                        src={paletteOverlaySrc}
-                        alt=""
-                        className="viewer-image viewer-overlay"
-                      />
-                    ) : null}
-                    {pickingPaletteIndex !== null ? (
-                      <>
-                        <div className="viewer-interaction-layer" />
-                        {pickerPreview ? (
-                          <div
-                            className="viewer-pick-lens"
-                            style={{
-                              left: pickerPreview.left,
-                              top: pickerPreview.top,
-                              backgroundImage: `url(${selectedPhoto.previewSrc})`,
-                              backgroundSize: pickerPreview.backgroundSize,
-                              backgroundPosition: pickerPreview.backgroundPosition,
-                            }}
-                          >
-                            <span className="viewer-pick-lens-center" />
-                          </div>
-                        ) : null}
-                        <div className="viewer-pick-hint">吸管模式：点击主图取色，右键或 Esc 取消</div>
-                      </>
-                    ) : null}
-                  </>
-                ) : (
-                  <div className="viewer-empty">
-                    <strong>{TEXT.chooseImage}</strong>
-                    <p>{TEXT.chooseImageHint}</p>
-                  </div>
-                )}
-              </div>
+              <>
+                <aside className="detail-side-column detail-left-column">
+                  <section className="info-block">
+                    <h4>{TEXT.currentGroup}</h4>
+                    <div className="tag-list">
+                      <button
+                        className={`tag-chip ${selectedPhoto?.groupId === null ? "active" : ""}`}
+                        onClick={() => assignPhotoToGroup(null)}
+                        type="button"
+                      >
+                        {TEXT.ungrouped}
+                      </button>
+                      {currentArtistGroups.map((group) => (
+                        <button
+                          key={group.id}
+                          className={`tag-chip ${
+                            selectedPhoto?.groupId === group.id ? "active" : ""
+                          }`}
+                          onClick={() => assignPhotoToGroup(group.id)}
+                          onContextMenu={(event) => {
+                            event.preventDefault();
+                            requestDeleteGroup(group.id, group.name, currentArtist ?? "");
+                          }}
+                          type="button"
+                        >
+                          {group.name}
+                        </button>
+                      ))}
+                      <button
+                        className="tag-plus"
+                        type="button"
+                        aria-label={TEXT.createGroup}
+                        onClick={() => currentArtist && openCreateGroupDialog(currentArtist)}
+                      >
+                        <Plus size={10} />
+                      </button>
+                    </div>
+                  </section>
 
-              <div className="viewer-toolbar">
-                <div className="viewer-toolbar-left">
-                  <button
-                    type="button"
-                    className="viewer-back-button"
-                    onClick={returnToGroupView}
+                  <section className="info-block">
+                    <h4>{TEXT.tags}</h4>
+                    <div className="tag-list">
+                      {tagLibrary.map((tag) => (
+                        <button
+                          key={tag}
+                          className={`tag-chip ${
+                            selectedPhoto?.tags.includes(tag) ? "active" : ""
+                          }`}
+                          onClick={() => toggleTag(tag)}
+                          onContextMenu={(event) => {
+                            event.preventDefault();
+                            requestDeleteTag(tag);
+                          }}
+                          type="button"
+                        >
+                          {tag}
+                        </button>
+                      ))}
+                      <button
+                        className="tag-plus"
+                        type="button"
+                        aria-label="添加标签"
+                        onClick={openCreateTagDialog}
+                      >
+                        <Plus size={10} />
+                      </button>
+                    </div>
+                  </section>
+                </aside>
+
+                <section className="viewer-column">
+                  <div
+                    className={`viewer-card ${pickingPaletteIndex !== null ? "picking" : ""}`}
+                    ref={viewerCardRef}
+                    onClick={handleViewerPick}
+                    onMouseMove={handleViewerPickMove}
+                    onMouseLeave={handleViewerPickLeave}
+                    onContextMenu={handleViewerPickCancel}
                   >
-                    <ArrowLeft size={14} />
-                    <span>返回上一页</span>
-                  </button>
-                </div>
-
-                <div className="viewer-toolbar-right">
-                  <div className="viewer-meta">
-                    <button
-                      type="button"
-                      className={`viewer-star-button ${selectedPhoto?.starred ? "active" : ""}`}
-                      onClick={() => selectedPhoto && togglePhotoStar(selectedPhoto.path)}
-                      aria-label={selectedPhoto?.starred ? "取消星标" : "标记星标"}
-                    >
-                      <Star size={14} fill={selectedPhoto?.starred ? "currentColor" : "none"} />
-                    </button>
-                    <span>
-                      {imageMetrics
-                        ? `${imageMetrics.width} x ${imageMetrics.height}`
-                        : "-"}
-                    </span>
-                    <span>{imageMetrics ? formatAspectRatio(imageMetrics.width, imageMetrics.height) : "-"}</span>
+                    {selectedPhoto ? (
+                      <>
+                        <img
+                          src={selectedPhoto.previewSrc}
+                          alt={selectedPhoto.name}
+                          className="viewer-image"
+                        />
+                        {paletteOverlaySrc ? (
+                          <img
+                            src={paletteOverlaySrc}
+                            alt=""
+                            className="viewer-image viewer-overlay"
+                          />
+                        ) : null}
+                        {pickingPaletteIndex !== null ? (
+                          <>
+                            <div className="viewer-interaction-layer" />
+                            {pickerPreview ? (
+                              <div
+                                className="viewer-pick-lens"
+                                style={{
+                                  left: pickerPreview.left,
+                                  top: pickerPreview.top,
+                                  backgroundImage: `url(${selectedPhoto.previewSrc})`,
+                                  backgroundSize: pickerPreview.backgroundSize,
+                                  backgroundPosition: pickerPreview.backgroundPosition,
+                                }}
+                              >
+                                <span className="viewer-pick-lens-center" />
+                              </div>
+                            ) : null}
+                            <div className="viewer-pick-hint">吸管模式：点击主图取色，右键或 Esc 取消</div>
+                          </>
+                        ) : null}
+                      </>
+                    ) : (
+                      <div className="viewer-empty">
+                        <strong>{TEXT.chooseImage}</strong>
+                        <p>{TEXT.chooseImageHint}</p>
+                      </div>
+                    )}
                   </div>
 
-                  <div className="viewer-tool-buttons">
-                    <button type="button" aria-label="图片信息">
-                      <Info size={14} />
-                    </button>
-                    <button type="button" aria-label="更多操作">
-                      <MoreHorizontal size={14} />
-                    </button>
+                  <div className="viewer-toolbar">
+                    <div className="viewer-toolbar-left">
+                      <button
+                        type="button"
+                        className="viewer-back-button"
+                        onClick={returnToGroupView}
+                      >
+                        <ArrowLeft size={14} />
+                        <span>返回上一页</span>
+                      </button>
+                    </div>
+
+                    <div className="viewer-toolbar-right">
+                      <div className="viewer-meta">
+                        <button
+                          type="button"
+                          className={`viewer-star-button ${selectedPhoto?.starred ? "active" : ""}`}
+                          onClick={() => selectedPhoto && togglePhotoStar(selectedPhoto.path)}
+                          aria-label={selectedPhoto?.starred ? "取消星标" : "标记星标"}
+                        >
+                          <Star size={14} fill={selectedPhoto?.starred ? "currentColor" : "none"} />
+                        </button>
+                        <span>
+                          {imageMetrics
+                            ? `${imageMetrics.width} x ${imageMetrics.height}`
+                            : "-"}
+                        </span>
+                        <span>{imageMetrics ? formatAspectRatio(imageMetrics.width, imageMetrics.height) : "-"}</span>
+                      </div>
+
+                      <div className="viewer-tool-buttons">
+                        <button type="button" aria-label="图片信息">
+                          <Info size={14} />
+                        </button>
+                        <button type="button" aria-label="更多操作">
+                          <MoreHorizontal size={14} />
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              </div>
-            </section>
+                </section>
+              </>
             )}
 
-            <aside className={`info-column ${showGroupWorkspace ? "group-note-column" : ""}`}>
+            <aside
+              className={`info-column ${showGroupWorkspace ? "group-note-column" : "detail-right-column"}`}
+            >
               {showGroupWorkspace ? (
                 <section className="info-block">
                   <div className="info-block-header">
@@ -2346,6 +2566,68 @@ function App() {
                 </section>
               ) : (
                 <>
+              <section className="info-block histogram-panel">
+                <div className="info-block-header">
+                  <h4>{TEXT.histogram}</h4>
+                </div>
+                {selectedPhoto ? (
+                  histogramData && selectedPhotoHistogramPoints ? (
+                    <div className="histogram-card">
+                      <div className="histogram-surface">
+                        <svg
+                          viewBox="0 0 100 100"
+                          preserveAspectRatio="none"
+                          aria-label="当前图片直方图"
+                        >
+                          <polyline
+                            points={selectedPhotoHistogramPoints.luminance}
+                            className="histogram-line histogram-luminance"
+                          />
+                          <polyline
+                            points={selectedPhotoHistogramPoints.red}
+                            className="histogram-line histogram-red"
+                          />
+                          <polyline
+                            points={selectedPhotoHistogramPoints.green}
+                            className="histogram-line histogram-green"
+                          />
+                          <polyline
+                            points={selectedPhotoHistogramPoints.blue}
+                            className="histogram-line histogram-blue"
+                          />
+                        </svg>
+                      </div>
+                      <div className="histogram-legend">
+                        <span className="histogram-legend-item">
+                          <i className="histogram-dot histogram-dot-luminance" />
+                          明度
+                        </span>
+                        <span className="histogram-legend-item">
+                          <i className="histogram-dot histogram-dot-red" />
+                          红
+                        </span>
+                        <span className="histogram-legend-item">
+                          <i className="histogram-dot histogram-dot-green" />
+                          绿
+                        </span>
+                        <span className="histogram-legend-item">
+                          <i className="histogram-dot histogram-dot-blue" />
+                          蓝
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="info-empty">
+                      {histogramLoadingPath === selectedPhoto.path
+                        ? TEXT.histogramLoading
+                        : TEXT.paletteEmpty}
+                    </div>
+                  )
+                ) : (
+                  <div className="info-empty">{TEXT.histogramEmpty}</div>
+                )}
+              </section>
+
               <section className="info-block">
                 <div className="info-block-header">
                   <h4>{TEXT.palette}</h4>
@@ -2529,73 +2811,6 @@ function App() {
                     </div>
                   </div>
                 ) : null}
-              </section>
-
-              <section className="info-block">
-                <h4>{TEXT.currentGroup}</h4>
-                <div className="tag-list">
-                  <button
-                    className={`tag-chip ${selectedPhoto?.groupId === null ? "active" : ""}`}
-                    onClick={() => assignPhotoToGroup(null)}
-                    type="button"
-                  >
-                    {TEXT.ungrouped}
-                  </button>
-                  {currentArtistGroups.map((group) => (
-                    <button
-                      key={group.id}
-                      className={`tag-chip ${
-                        selectedPhoto?.groupId === group.id ? "active" : ""
-                      }`}
-                      onClick={() => assignPhotoToGroup(group.id)}
-                      onContextMenu={(event) => {
-                        event.preventDefault();
-                        requestDeleteGroup(group.id, group.name, currentArtist ?? "");
-                      }}
-                      type="button"
-                    >
-                      {group.name}
-                    </button>
-                  ))}
-                  <button
-                    className="tag-plus"
-                    type="button"
-                    aria-label={TEXT.createGroup}
-                    onClick={() => currentArtist && openCreateGroupDialog(currentArtist)}
-                  >
-                    <Plus size={10} />
-                  </button>
-                </div>
-              </section>
-
-              <section className="info-block">
-                <h4>{TEXT.tags}</h4>
-                <div className="tag-list">
-                  {tagLibrary.map((tag) => (
-                    <button
-                      key={tag}
-                      className={`tag-chip ${
-                        selectedPhoto?.tags.includes(tag) ? "active" : ""
-                      }`}
-                      onClick={() => toggleTag(tag)}
-                      onContextMenu={(event) => {
-                        event.preventDefault();
-                        requestDeleteTag(tag);
-                      }}
-                      type="button"
-                    >
-                      {tag}
-                    </button>
-                  ))}
-                  <button
-                    className="tag-plus"
-                    type="button"
-                    aria-label="添加标签"
-                    onClick={openCreateTagDialog}
-                  >
-                    <Plus size={10} />
-                  </button>
-                </div>
               </section>
 
               <section className="info-block">
