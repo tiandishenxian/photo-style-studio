@@ -1145,6 +1145,25 @@ function App() {
     }
   }
 
+  async function handleHideSelectedPhotos() {
+    if (selectedGroupPhotoPaths.length === 0) {
+      return;
+    }
+
+    try {
+      const state = await invoke<FrontendState>("hide_photos", {
+        photoPaths: selectedGroupPhotoPaths,
+      });
+      applyState(state);
+      setSelectedGroupPhotoPaths([]);
+      setStatusMessage(`已隐藏 ${selectedGroupPhotoPaths.length} 张照片`);
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : String(error ?? "隐藏照片失败"),
+      );
+    }
+  }
+
   function openCreateGroupDialog(photographerName: string) {
     setCreateGroupArtist(photographerName);
     setNewGroupName("");
@@ -2041,6 +2060,15 @@ function App() {
                       <Download size={14} />
                       导出分组
                     </button>
+                    {selectedGroupPhotoPaths.length > 0 ? (
+                      <button
+                        type="button"
+                        className="move-group-button"
+                        onClick={() => void handleHideSelectedPhotos()}
+                      >
+                        隐藏照片
+                      </button>
+                    ) : null}
                     {selectedGroupPhotoPaths.length > 0 ? (
                       <button
                         type="button"

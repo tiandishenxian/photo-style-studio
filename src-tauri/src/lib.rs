@@ -59,6 +59,8 @@ struct StoredPhotoMeta {
     content_hash: Option<String>,
     #[serde(default)]
     hidden_duplicate: bool,
+    #[serde(default)]
+    hidden_manual: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +208,10 @@ fn save_app_state(app: AppHandle, payload: SaveStatePayload) -> Result<(), Strin
             .as_ref()
             .map(|meta| meta.hidden_duplicate)
             .unwrap_or(false);
+        let previous_hidden_manual = previous_meta
+            .as_ref()
+            .map(|meta| meta.hidden_manual)
+            .unwrap_or(false);
         next_metadata.insert(
             normalized_path,
             StoredPhotoMeta {
@@ -217,11 +223,32 @@ fn save_app_state(app: AppHandle, payload: SaveStatePayload) -> Result<(), Strin
                 starred: photo.starred,
                 content_hash: previous_content_hash,
                 hidden_duplicate: previous_hidden_duplicate,
+                hidden_manual: previous_hidden_manual,
             },
         );
     }
     state.photo_metadata = next_metadata;
     save_state(&app, &state)
+}
+
+#[tauri::command]
+fn hide_photos(app: AppHandle, photo_paths: Vec<String>) -> Result<FrontendState, String> {
+    if photo_paths.is_empty() {
+        return build_frontend_state(load_state(&app)?);
+    }
+
+    let mut state = load_state(&app)?;
+    for path in photo_paths {
+        let normalized_path = normalize_path_string(&path);
+        let meta = state
+            .photo_metadata
+            .entry(normalized_path.clone())
+            .or_insert_with(|| default_photo_meta(&normalized_path));
+        meta.hidden_manual = true;
+    }
+
+    save_state(&app, &state)?;
+    build_frontend_state(load_state(&app)?)
 }
 
 #[tauri::command]
@@ -672,7 +699,7 @@ fn build_frontend_state(state: AppState) -> Result<FrontendState, String> {
                 .get(&normalized_path)
                 .cloned()
                 .unwrap_or_else(|| default_photo_meta(&normalized_path));
-        if meta.hidden_duplicate && !meta.starred {
+        if meta.hidden_manual || (meta.hidden_duplicate && !meta.starred) {
             continue;
         }
             let palette = if meta.palette.is_empty() || looks_like_placeholder_palette(&meta.palette)
@@ -778,6 +805,7 @@ fn default_photo_meta(seed: &str) -> StoredPhotoMeta {
         starred: false,
         content_hash: None,
         hidden_duplicate: false,
+        hidden_manual: false,
     }
 }
 
@@ -1102,7 +1130,8 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 summary TEXT NOT NULL,
                 starred INTEGER NOT NULL DEFAULT 0,
                 content_hash TEXT,
-                hidden_duplicate INTEGER NOT NULL DEFAULT 0
+                hidden_duplicate INTEGER NOT NULL DEFAULT 0,
+                hidden_manual INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS tags (
@@ -1151,6 +1180,10 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
     );
     let _ = connection.execute(
         "ALTER TABLE photo_metadata ADD COLUMN hidden_duplicate INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE photo_metadata ADD COLUMN hidden_manual INTEGER NOT NULL DEFAULT 0",
         [],
     );
 
@@ -1227,7 +1260,7 @@ fn read_full_state(connection: &Connection) -> Result<AppState, String> {
 
     let mut metadata_statement = connection
         .prepare(
-            "SELECT path, group_id, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate
+            "SELECT path, group_id, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate, hidden_manual
              FROM photo_metadata",
         )
         .map_err(|err| err.to_string())?;
@@ -1246,6 +1279,7 @@ fn read_full_state(connection: &Connection) -> Result<AppState, String> {
                     starred: row.get::<_, i64>(6).unwrap_or(0) != 0,
                     content_hash: row.get(7).ok(),
                     hidden_duplicate: row.get::<_, i64>(8).unwrap_or(0) != 0,
+                    hidden_manual: row.get::<_, i64>(9).unwrap_or(0) != 0,
                 },
             ))
         })
@@ -1360,8 +1394,8 @@ fn write_full_state(connection: &Connection, state: &AppState) -> Result<(), Str
         let palette_json = serde_json::to_string(&meta.palette).map_err(|err| err.to_string())?;
         transaction
             .execute(
-                "INSERT INTO photo_metadata (path, group_id, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO photo_metadata (path, group_id, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate, hidden_manual)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     path,
                     meta.group_id,
@@ -1371,7 +1405,8 @@ fn write_full_state(connection: &Connection, state: &AppState) -> Result<(), Str
                     meta.summary,
                     if meta.starred { 1 } else { 0 },
                     meta.content_hash,
-                    if meta.hidden_duplicate { 1 } else { 0 }
+                    if meta.hidden_duplicate { 1 } else { 0 },
+                    if meta.hidden_manual { 1 } else { 0 }
                 ],
             )
             .map_err(|err| err.to_string())?;
@@ -1557,6 +1592,7 @@ pub fn run() {
             rename_photographer,
             extract_photo_palette,
             dedupe_photos_by_content,
+            hide_photos,
             export_group_photos,
             save_group_view_position,
             delete_group_view_position
