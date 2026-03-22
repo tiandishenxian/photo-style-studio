@@ -942,14 +942,37 @@ button {
   margin: 6px 0 8px;
 }
 
-.viewer-toolbar-spacer {
-  flex: 1;
+.viewer-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 
 .viewer-toolbar-right {
   display: flex;
   align-items: center;
   gap: 14px;
+}
+
+.viewer-back-button {
+  height: 34px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #dddff0;
+  border-radius: 12px;
+  background: #ffffff;
+  color: #6d7288;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.viewer-back-button:hover {
+  border-color: #cfc9ff;
+  background: #f8f7ff;
+  color: #5b4cf0;
 }
 
 .viewer-meta {

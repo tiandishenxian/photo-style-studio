@@ -10,6 +10,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  ArrowLeft,
   ChevronDown,
   ChevronRight,
   Filter,
@@ -99,6 +100,8 @@ type DedupePhotosResult = {
   hiddenFiles: number;
   state: FrontendState;
 };
+
+type ExportMode = "all" | "starred";
 
 type ArchiveImportPreview = {
   parsedPhotographerName: string;
@@ -480,6 +483,8 @@ function App() {
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("group");
   const [thumbnailScale, setThumbnailScale] = useState<ThumbnailScale>("medium");
   const [selectedGroupPhotoPaths, setSelectedGroupPhotoPaths] = useState<string[]>([]);
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [exportMode, setExportMode] = useState<ExportMode>("all");
   const [moveDialogOpen, setMoveDialogOpen] = useState(false);
   const [moveTargetGroupId, setMoveTargetGroupId] = useState<string>("unassigned");
   const [moveNewGroupName, setMoveNewGroupName] = useState("");
@@ -517,10 +522,12 @@ function App() {
   const colorInputRef = useRef<HTMLInputElement | null>(null);
   const viewerCardRef = useRef<HTMLDivElement | null>(null);
   const mainBodyRef = useRef<HTMLDivElement | null>(null);
+  const filmstripRowRef = useRef<HTMLDivElement | null>(null);
   const paletteHydrationRef = useRef<Set<string>>(new Set());
   const groupScrollTopRef = useRef(0);
   const restorePromptTimerRef = useRef<number | null>(null);
   const pendingScrollSaveTimerRef = useRef<number | null>(null);
+  const pendingDirectRestoreScrollRef = useRef<number | null>(null);
 
   useEffect(() => {
     const bootstrap = async () => {
@@ -709,6 +716,11 @@ function App() {
 
     return currentArtistPhotos.filter((photo) => photo.groupId === activeGroupId);
   }, [activeGroupId, currentArtistPhotos]);
+
+  const starredVisiblePhotos = useMemo(
+    () => visiblePhotos.filter((photo) => photo.starred),
+    [visiblePhotos],
+  );
 
   useEffect(() => {
     if (visiblePhotos.length === 0) {
@@ -947,6 +959,13 @@ function App() {
   const showGroupWorkspace = workspaceView === "group";
   const selectedPhotoPalette = selectedPhoto ? buildPalette(selectedPhoto.palette) : [];
 
+  function returnToGroupView() {
+    const savedScrollTop = currentGroupViewKey ? groupViewPositions[currentGroupViewKey] ?? 0 : 0;
+    pendingDirectRestoreScrollRef.current = savedScrollTop;
+    setRestorePrompt(null);
+    setWorkspaceView("group");
+  }
+
   useEffect(() => {
     if (restorePromptTimerRef.current !== null) {
       window.clearTimeout(restorePromptTimerRef.current);
@@ -962,6 +981,17 @@ function App() {
     groupScrollTopRef.current = 0;
     if (mainBodyRef.current) {
       mainBodyRef.current.scrollTop = 0;
+    }
+
+    const pendingDirectRestoreScroll = pendingDirectRestoreScrollRef.current;
+    if (pendingDirectRestoreScroll !== null) {
+      pendingDirectRestoreScrollRef.current = null;
+      if (mainBodyRef.current) {
+        mainBodyRef.current.scrollTop = pendingDirectRestoreScroll;
+      }
+      groupScrollTopRef.current = pendingDirectRestoreScroll;
+      setRestorePrompt(null);
+      return;
     }
 
     if (savedScrollTop <= 0) {
@@ -988,6 +1018,21 @@ function App() {
       }
     };
   }, [currentGroupViewKey, showGroupWorkspace]);
+
+  useEffect(() => {
+    if (workspaceView !== "detail" || !selectedPhotoPath || !filmstripRowRef.current) {
+      return;
+    }
+
+    const activeThumb = filmstripRowRef.current.querySelector<HTMLButtonElement>(
+      `[data-photo-path="${CSS.escape(selectedPhotoPath)}"]`,
+    );
+    activeThumb?.scrollIntoView({
+      behavior: "smooth",
+      inline: "center",
+      block: "nearest",
+    });
+  }, [selectedPhotoPath, workspaceView]);
 
   useEffect(() => {
     if (!showGroupWorkspace || !currentGroupViewKey) {
@@ -1090,24 +1135,39 @@ function App() {
   }
 
   async function handleExportGroup() {
-    if (visiblePhotos.length === 0) {
+    const exportPhotos = exportMode === "starred" ? starredVisiblePhotos : visiblePhotos;
+    if (exportPhotos.length === 0) {
       return;
     }
 
     try {
-      setStatusMessage("正在导出分组图片...");
+      setStatusMessage(exportMode === "starred" ? "正在导出星标图片..." : "正在导出分组图片...");
       const result = await invoke<ExportGroupPhotosResult>("export_group_photos", {
-        photoPaths: visiblePhotos.map((photo) => photo.path),
-        groupName: activeGroupName,
+        photoPaths: exportPhotos.map((photo) => photo.path),
+        groupName: exportMode === "starred" ? `${activeGroupName}-starred` : activeGroupName,
       });
       setStatusMessage(
         `${TEXT.exportSuccess}：${result.exportedFiles} 张 -> ${result.targetDir}`,
       );
+      setExportDialogOpen(false);
     } catch (error) {
       setStatusMessage(
         error instanceof Error ? error.message : String(error ?? "导出分组失败"),
       );
     }
+  }
+
+  function openExportDialog() {
+    if (visiblePhotos.length === 0) {
+      return;
+    }
+
+    setExportMode("all");
+    setExportDialogOpen(true);
+  }
+
+  function closeExportDialog() {
+    setExportDialogOpen(false);
   }
 
   async function handleDedupeCurrentGroup() {
@@ -1987,7 +2047,7 @@ function App() {
             <button
               type="button"
               className="breadcrumb-link"
-              onClick={() => setWorkspaceView("group")}
+              onClick={returnToGroupView}
             >
               {currentArtist ?? TEXT.artistNotSelected}
             </button>
@@ -1995,7 +2055,7 @@ function App() {
             <button
               type="button"
               className="header-pill breadcrumb-pill-button"
-              onClick={() => setWorkspaceView("group")}
+              onClick={returnToGroupView}
             >
               {activeGroupName}
             </button>
@@ -2045,21 +2105,32 @@ function App() {
                   <div className="group-browser-actions">
                     <button
                       type="button"
-                      className="move-group-button"
-                      onClick={() => void handleDedupeCurrentGroup()}
-                      disabled={visiblePhotos.length < 2 || dedupeRunning}
-                    >
-                      {dedupeRunning ? "正在去重..." : "一键去重"}
-                    </button>
-                    <button
-                      type="button"
                       className="move-group-button export-group-button"
-                      onClick={() => void handleExportGroup()}
+                      onClick={openExportDialog}
                       disabled={visiblePhotos.length === 0}
                     >
                       <Download size={14} />
                       导出分组
                     </button>
+                    {selectedGroupPhotoPaths.length > 0 ? (
+                      <button
+                        type="button"
+                        className="move-group-button"
+                        onClick={() => setSelectedGroupPhotoPaths([])}
+                      >
+                        取消选中
+                      </button>
+                    ) : null}
+                    {selectedGroupPhotoPaths.length === 0 ? (
+                      <button
+                        type="button"
+                        className="move-group-button"
+                        onClick={() => void handleDedupeCurrentGroup()}
+                        disabled={visiblePhotos.length < 2 || dedupeRunning}
+                      >
+                        {dedupeRunning ? "正在去重..." : "一键去重"}
+                      </button>
+                    ) : null}
                     {selectedGroupPhotoPaths.length > 0 ? (
                       <button
                         type="button"
@@ -2216,7 +2287,16 @@ function App() {
               </div>
 
               <div className="viewer-toolbar">
-                <div className="viewer-toolbar-spacer" />
+                <div className="viewer-toolbar-left">
+                  <button
+                    type="button"
+                    className="viewer-back-button"
+                    onClick={returnToGroupView}
+                  >
+                    <ArrowLeft size={14} />
+                    <span>返回上一页</span>
+                  </button>
+                </div>
 
                 <div className="viewer-toolbar-right">
                   <div className="viewer-meta">
@@ -2564,10 +2644,11 @@ function App() {
             </div>
 
             {currentArtist ? (
-              <div className="filmstrip-row" onWheel={handleFilmstripWheel}>
+              <div className="filmstrip-row" onWheel={handleFilmstripWheel} ref={filmstripRowRef}>
                 {visiblePhotos.map((photo) => (
                   <button
                     key={photo.path}
+                    data-photo-path={photo.path}
                     className={`film-thumb ${selectedPhotoPath === photo.path ? "active" : ""}`}
                     onClick={() => setSelectedPhotoPath(photo.path)}
                     type="button"
@@ -2658,6 +2739,47 @@ function App() {
               </button>
               <button type="button" className="modal-primary" onClick={confirmMovePhotos}>
                 确认移动
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {exportDialogOpen ? (
+        <div className="modal-overlay" onClick={closeExportDialog} role="presentation">
+          <div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+          >
+            <h3>导出分组</h3>
+            <p className="modal-subtitle">{activeGroupName}</p>
+
+            <div className="move-group-list">
+              <button
+                type="button"
+                className={`move-group-option ${exportMode === "all" ? "active" : ""}`}
+                onClick={() => setExportMode("all")}
+              >
+                导出全部照片（{visiblePhotos.length} 张）
+              </button>
+              <button
+                type="button"
+                className={`move-group-option ${exportMode === "starred" ? "active" : ""}`}
+                onClick={() => setExportMode("starred")}
+                disabled={starredVisiblePhotos.length === 0}
+              >
+                仅导出星标照片（{starredVisiblePhotos.length} 张）
+              </button>
+            </div>
+
+            <div className="modal-actions">
+              <button type="button" className="modal-secondary" onClick={closeExportDialog}>
+                取消
+              </button>
+              <button type="button" className="modal-primary" onClick={() => void handleExportGroup()}>
+                开始导出
               </button>
             </div>
           </div>
