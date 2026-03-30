@@ -2065,6 +2065,11 @@ function App() {
                        setExpandedArtist(artist.photographerName);
                        setWorkspaceView("group");
                      }}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      openRenameArtistDialog(artist.photographerName);
+                    }}
                   >
                     <div className="artist-button-main">
                       <span
@@ -2095,14 +2100,7 @@ function App() {
                       >
                         {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
                       </span>
-                      <span
-                        className="artist-name"
-                        onContextMenu={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          openRenameArtistDialog(artist.photographerName);
-                        }}
-                      >
+                      <span className="artist-name">
                         {artist.photographerName}
                       </span>
                     </div>
