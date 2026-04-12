@@ -1,8 +1,10 @@
 ﻿import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type UIEvent as ReactUIEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
@@ -23,6 +25,7 @@ import {
   RotateCcw,
   Search,
   Settings,
+  Sparkles,
   Star,
   Trash2,
   Upload,
@@ -134,6 +137,12 @@ type PendingDeleteTarget =
       name: string;
     };
 
+type RenameGroupTarget = {
+  id: string;
+  name: string;
+  photographerName: string;
+};
+
 type ImageMetrics = {
   width: number;
   height: number;
@@ -154,7 +163,34 @@ type PickerPreview = {
   backgroundPosition: string;
 };
 
-type WorkspaceView = "group" | "detail";
+type SimilarSearchResult = {
+  path: string;
+  score: number;
+};
+
+type SimilarSearchResponse = {
+  results: SimilarSearchResult[];
+  total: number;
+  cachedCount: number;
+  computedCount: number;
+};
+
+type SimilaritySearchSettings = {
+  threadCount: number;
+  sampleSize: number;
+};
+
+type SimilarityPreheatProgress = {
+  photographerName: string;
+  processed: number;
+  total: number;
+  cachedCount: number;
+  computedCount: number;
+  completed: boolean;
+  cancelled: boolean;
+};
+
+type WorkspaceView = "group" | "detail" | "similar";
 
 type ThumbnailScale = "small" | "medium" | "large" | "xlarge";
 
@@ -199,6 +235,18 @@ const TEXT = {
   importSuccessNew: "已创建并导入这个摄影师。",
   importSuccessMerge: "已合并到已有摄影师文件夹。",
   exportSuccess: "分组导出完成",
+  similarSearch: "相似搜索",
+  similarSearchAction: "上传参考图",
+  similarSearchLoading: "正在查找相似图片...",
+  similarSearchEmpty: "上传一张参考图后，这里会显示当前摄影师图库里最相似的 10 张图片。",
+  similarSearchNoResult: "当前摄影师图库里还没有可匹配的图片。",
+  similarSearchResult: "相似结果",
+  similaritySettings: "相似搜索设置",
+  similarityThreadCount: "线程数",
+  similaritySampleSize: "采样数",
+  similarityCacheReady: "缓存已就绪",
+  similarityCacheBuilding: "正在建立相似搜索缓存",
+  similarityCacheRefining: "正在补全相似搜索特征",
   loading: "正在加载...",
   importing: "正在导入...",
   unsupportedArchive: "目前只支持 ZIP 压缩包。",
@@ -222,6 +270,9 @@ function normalizeSearchKeyword(value: string) {
     .replace(/[\s_\-.]+/g, "")
     .trim();
 }
+
+const SIMILARITY_THREAD_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8];
+const SIMILARITY_SAMPLE_OPTIONS = [32, 48, 56, 64, 80];
 
 function hydratePhotos(photos: PersistedPhoto[]): PhotoItem[] {
   return photos.map((photo) => ({
@@ -592,6 +643,27 @@ function App() {
   const [moveNewGroupName, setMoveNewGroupName] = useState("");
   const [renameArtistTarget, setRenameArtistTarget] = useState<string | null>(null);
   const [renameArtistValue, setRenameArtistValue] = useState("");
+  const [renameGroupTarget, setRenameGroupTarget] = useState<RenameGroupTarget | null>(null);
+  const [renameGroupValue, setRenameGroupValue] = useState("");
+  const [similarSearchReferenceName, setSimilarSearchReferenceName] = useState("");
+  const [similarSearchReferenceSrc, setSimilarSearchReferenceSrc] = useState<string | null>(null);
+  const [similarSearchLoading, setSimilarSearchLoading] = useState(false);
+  const [similarSearchLoadingMessage, setSimilarSearchLoadingMessage] = useState(
+    TEXT.similarSearchLoading,
+  );
+  const [similarSearchResults, setSimilarSearchResults] = useState<SimilarSearchResult[]>([]);
+  const [similaritySettingsOpen, setSimilaritySettingsOpen] = useState(false);
+  const [similaritySettings, setSimilaritySettings] = useState<SimilaritySearchSettings>({
+    threadCount: 3,
+    sampleSize: 56,
+  });
+  const [similaritySettingsDraft, setSimilaritySettingsDraft] = useState<SimilaritySearchSettings>({
+    threadCount: 3,
+    sampleSize: 56,
+  });
+  const [similaritySettingsSaving, setSimilaritySettingsSaving] = useState(false);
+  const [similarityPreheatProgress, setSimilarityPreheatProgress] =
+    useState<SimilarityPreheatProgress | null>(null);
   const [archiveImportPreview, setArchiveImportPreview] = useState<ArchiveImportPreview | null>(null);
   const [archiveImportPath, setArchiveImportPath] = useState<string | null>(null);
   const [archiveImportMode, setArchiveImportMode] = useState<"new" | "merge">("new");
@@ -624,10 +696,13 @@ function App() {
     scrollTop: number;
   } | null>(null);
   const colorInputRef = useRef<HTMLInputElement | null>(null);
+  const similarSearchInputRef = useRef<HTMLInputElement | null>(null);
   const viewerCardRef = useRef<HTMLDivElement | null>(null);
   const mainBodyRef = useRef<HTMLDivElement | null>(null);
   const filmstripRowRef = useRef<HTMLDivElement | null>(null);
   const paletteHydrationRef = useRef<Set<string>>(new Set());
+  const currentArtistRef = useRef<string | null>(null);
+  const currentArtistPhotosRef = useRef<PhotoItem[]>([]);
   const groupScrollTopRef = useRef(0);
   const restorePromptTimerRef = useRef<number | null>(null);
   const pendingScrollSaveTimerRef = useRef<number | null>(null);
@@ -636,8 +711,13 @@ function App() {
   useEffect(() => {
     const bootstrap = async () => {
       try {
-        const state = await invoke<FrontendState>("load_app_state");
+        const [state, settings] = await Promise.all([
+          invoke<FrontendState>("load_app_state"),
+          invoke<SimilaritySearchSettings>("get_similarity_search_settings"),
+        ]);
         applyState(state);
+        setSimilaritySettings(settings);
+        setSimilaritySettingsDraft(settings);
         setStatusMessage("");
       } catch (error) {
         setStatusMessage(
@@ -696,6 +776,14 @@ function App() {
   }, []);
 
   useEffect(() => {
+    return () => {
+      if (similarSearchReferenceSrc?.startsWith("blob:")) {
+        URL.revokeObjectURL(similarSearchReferenceSrc);
+      }
+    };
+  }, [similarSearchReferenceSrc]);
+
+  useEffect(() => {
     let cleanup: (() => void) | undefined;
 
     void listen<DedupeProgress>("dedupe-progress", (event) => {
@@ -711,6 +799,28 @@ function App() {
 
     return () => {
       cleanup?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let progressCleanup: (() => void) | undefined;
+    let errorCleanup: (() => void) | undefined;
+
+    void listen<SimilarityPreheatProgress>("similarity-preheat-progress", (event) => {
+      setSimilarityPreheatProgress(event.payload);
+    }).then((unlisten) => {
+      progressCleanup = unlisten;
+    });
+
+    void listen<string>("similarity-preheat-error", (event) => {
+      setStatusMessage(event.payload);
+    }).then((unlisten) => {
+      errorCleanup = unlisten;
+    });
+
+    return () => {
+      progressCleanup?.();
+      errorCleanup?.();
     };
   }, []);
 
@@ -808,6 +918,70 @@ function App() {
       })
       .map(({ photo }) => photo);
   }, [currentArtist, photos]);
+
+  const currentArtistPhotoPaths = useMemo(
+    () => currentArtistPhotos.map((photo) => photo.path).sort(),
+    [currentArtistPhotos],
+  );
+
+  useEffect(() => {
+    currentArtistRef.current = currentArtist;
+    currentArtistPhotosRef.current = currentArtistPhotos;
+  }, [currentArtist, currentArtistPhotos]);
+
+  useEffect(() => {
+    if (!hydrated || !currentArtist) {
+      setSimilarityPreheatProgress(null);
+      return;
+    }
+
+    void invoke<SimilarityPreheatProgress | null>("get_similarity_preheat_status", {
+      photographerName: currentArtist,
+    })
+      .then((progress) => {
+        setSimilarityPreheatProgress(progress);
+      })
+      .catch(() => {
+        setSimilarityPreheatProgress(null);
+      });
+  }, [currentArtist, hydrated]);
+
+  useEffect(() => {
+    if (!hydrated || !currentArtist || currentArtistPhotos.length === 0) {
+      return;
+    }
+
+    void invoke("preheat_similarity_features", {
+      photographerName: currentArtist,
+      photoPaths: currentArtistPhotoPaths,
+    }).catch((error) => {
+      setStatusMessage(error instanceof Error ? error.message : String(error ?? "预热失败"));
+    });
+  }, [
+    currentArtist,
+    currentArtistPhotoPaths,
+    currentArtistPhotos.length,
+    hydrated,
+    similaritySettings.sampleSize,
+    similaritySettings.threadCount,
+  ]);
+
+  const similarSearchResultPhotos = useMemo(() => {
+    const lookup = new Map(currentArtistPhotos.map((photo) => [photo.path, photo]));
+    return similarSearchResults
+      .map((result) => {
+        const photo = lookup.get(result.path);
+        if (!photo) {
+          return null;
+        }
+
+        return {
+          photo,
+          score: result.score,
+        };
+      })
+      .filter((item): item is { photo: PhotoItem; score: number } => item !== null);
+  }, [currentArtistPhotos, similarSearchResults]);
 
   const visiblePhotos = useMemo(() => {
     if (activeGroupId === "all") {
@@ -1061,6 +1235,7 @@ function App() {
   }, [selectedPhoto, visiblePhotos]);
 
   const showGroupWorkspace = workspaceView === "group";
+  const showSimilarWorkspace = workspaceView === "similar";
   const selectedPhotoPalette = selectedPhoto ? buildPalette(selectedPhoto.palette) : [];
   const selectedPhotoHistogramPoints = histogramData
     ? {
@@ -1536,9 +1711,13 @@ function App() {
       return;
     }
 
+    assignPhotoByPathToGroup(selectedPhoto.path, groupId);
+  }
+
+  function assignPhotoByPathToGroup(photoPath: string, groupId: string | null) {
     setPhotos((previous) =>
       previous.map((photo) =>
-        photo.path === selectedPhoto.path ? { ...photo, groupId } : photo,
+        photo.path === photoPath ? { ...photo, groupId } : photo,
       ),
     );
   }
@@ -1580,6 +1759,133 @@ function App() {
     setMoveDialogOpen(true);
   }
 
+  function openSimilarSearch() {
+    if (!currentArtist) {
+      return;
+    }
+
+    similarSearchInputRef.current?.click();
+  }
+
+  const runSimilarSearchWithFile = useCallback(async (file: File) => {
+    const activeArtist = currentArtistRef.current;
+    const artistPhotos = currentArtistPhotosRef.current;
+
+    if (!file || !activeArtist) {
+      if (!activeArtist) {
+        setStatusMessage("请先选择一个摄影师，再粘贴或上传参考图");
+      }
+      return;
+    }
+
+    if (similarSearchReferenceSrc?.startsWith("blob:")) {
+      URL.revokeObjectURL(similarSearchReferenceSrc);
+    }
+
+    const referenceSrc = URL.createObjectURL(file);
+    setSimilarSearchReferenceName(file.name || "剪贴板图片");
+    setSimilarSearchReferenceSrc(referenceSrc);
+    setSimilarSearchLoading(true);
+    setSimilarSearchLoadingMessage(TEXT.similarityCacheRefining);
+    setSimilarSearchResults([]);
+    setWorkspaceView("similar");
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const response = await invoke<SimilarSearchResponse>("search_similar_photos", {
+        referenceBytes: Array.from(new Uint8Array(buffer)),
+        photoPaths: artistPhotos.map((photo) => photo.path),
+      });
+      setSimilarSearchResults(response.results);
+      setStatusMessage(
+        response.results.length > 0
+          ? response.computedCount > 0
+            ? `已找到 ${response.results.length} 张最相似图片，并补全 ${response.computedCount} 张缓存`
+            : `已找到 ${response.results.length} 张最相似图片`
+          : TEXT.similarSearchNoResult,
+      );
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : String(error ?? "相似搜索失败"),
+      );
+    } finally {
+      setSimilarSearchLoading(false);
+      setSimilarSearchLoadingMessage(TEXT.similarSearchLoading);
+    }
+  }, [setStatusMessage, similarSearchReferenceSrc]);
+
+  async function handleSimilarSearchFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    await runSimilarSearchWithFile(file);
+  }
+
+  useEffect(() => {
+    const handlePaste = (event: ClipboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      const imageItem = Array.from(event.clipboardData?.items ?? []).find((item) =>
+        item.type.startsWith("image/"),
+      );
+      const file = imageItem?.getAsFile();
+
+      if (!file) {
+        return;
+      }
+
+      event.preventDefault();
+      void runSimilarSearchWithFile(
+        new File([file], file.name || "clipboard-image.png", { type: file.type || "image/png" }),
+      );
+    };
+
+    window.addEventListener("paste", handlePaste);
+    return () => {
+      window.removeEventListener("paste", handlePaste);
+    };
+  }, [runSimilarSearchWithFile]);
+
+  function openSimilaritySettingsDialog() {
+    setSimilaritySettingsDraft(similaritySettings);
+    setSimilaritySettingsOpen(true);
+  }
+
+  function closeSimilaritySettingsDialog() {
+    setSimilaritySettingsOpen(false);
+    setSimilaritySettingsDraft(similaritySettings);
+  }
+
+  async function saveSimilaritySettingsDialog() {
+    setSimilaritySettingsSaving(true);
+    try {
+      const nextSettings = await invoke<SimilaritySearchSettings>("save_similarity_search_settings", {
+        threadCount: similaritySettingsDraft.threadCount,
+        sampleSize: similaritySettingsDraft.sampleSize,
+      });
+      setSimilaritySettings(nextSettings);
+      setSimilaritySettingsDraft(nextSettings);
+      setSimilaritySettingsOpen(false);
+      setStatusMessage("相似搜索设置已保存");
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : String(error ?? "保存设置失败"));
+    } finally {
+      setSimilaritySettingsSaving(false);
+    }
+  }
+
   function openRenameArtistDialog(photographerName: string) {
     setRenameArtistTarget(photographerName);
     setRenameArtistValue(photographerName);
@@ -1588,6 +1894,20 @@ function App() {
   function closeRenameArtistDialog() {
     setRenameArtistTarget(null);
     setRenameArtistValue("");
+  }
+
+  function openRenameGroupDialog(groupId: string, groupName: string, photographerName: string) {
+    setRenameGroupTarget({
+      id: groupId,
+      name: groupName,
+      photographerName,
+    });
+    setRenameGroupValue(groupName);
+  }
+
+  function closeRenameGroupDialog() {
+    setRenameGroupTarget(null);
+    setRenameGroupValue("");
   }
 
   async function confirmRenameArtist() {
@@ -1612,6 +1932,24 @@ function App() {
         error instanceof Error ? error.message : String(error ?? "重命名摄影师失败"),
       );
     }
+  }
+
+  function confirmRenameGroup() {
+    if (!renameGroupTarget) {
+      return;
+    }
+
+    const nextName = renameGroupValue.trim();
+    if (!nextName) {
+      return;
+    }
+
+    setGroups((previous) =>
+      previous.map((group) =>
+        group.id === renameGroupTarget.id ? { ...group, name: nextName } : group,
+      ),
+    );
+    closeRenameGroupDialog();
   }
 
   function closeArchiveImportDialog() {
@@ -2119,6 +2457,19 @@ function App() {
                            setActiveGroupId(group.id);
                            setWorkspaceView("group");
                           }}
+                          onContextMenu={(event) => {
+                            if (group.id === "all" || group.id === "unassigned") {
+                              return;
+                            }
+
+                            event.preventDefault();
+                            event.stopPropagation();
+                            openRenameGroupDialog(
+                              group.id,
+                              group.name,
+                              artist.photographerName,
+                            );
+                          }}
                           type="button"
                         >
                           <span>{group.name}</span>
@@ -2210,7 +2561,7 @@ function App() {
             <button type="button" aria-label="筛选">
               <Filter size={15} />
             </button>
-            <button type="button" aria-label="设置">
+            <button type="button" aria-label="设置" onClick={openSimilaritySettingsDialog}>
               <Settings size={15} />
             </button>
           </div>
@@ -2239,7 +2590,15 @@ function App() {
             </div>
           ) : null}
 
-          <div className={`workspace-grid ${showGroupWorkspace ? "" : "detail-workspace-grid"}`}>
+          <div
+            className={`workspace-grid ${
+              showGroupWorkspace
+                ? ""
+                : showSimilarWorkspace
+                  ? "similar-workspace-grid"
+                  : "detail-workspace-grid"
+            }`}
+          >
             {showGroupWorkspace ? (
               <section className="group-browser-column">
                 <div className="group-browser-header">
@@ -2248,6 +2607,24 @@ function App() {
                     <span>{visiblePhotos.length} 张图片</span>
                   </div>
                   <div className="group-browser-actions">
+                    {similarityPreheatProgress &&
+                    currentArtist &&
+                    similarityPreheatProgress.photographerName === currentArtist ? (
+                      <span className="similarity-cache-status">
+                        {similarityPreheatProgress.completed && !similarityPreheatProgress.cancelled
+                          ? TEXT.similarityCacheReady
+                          : `${TEXT.similarityCacheBuilding} ${similarityPreheatProgress.processed}/${similarityPreheatProgress.total}`}
+                      </span>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="move-group-button export-group-button"
+                      onClick={openSimilarSearch}
+                      disabled={!currentArtist || currentArtistPhotos.length === 0 || similarSearchLoading}
+                    >
+                      <Sparkles size={14} />
+                      {similarSearchLoading ? similarSearchLoadingMessage : TEXT.similarSearchAction}
+                    </button>
                     <button
                       type="button"
                       className="move-group-button export-group-button"
@@ -2378,6 +2755,94 @@ function App() {
                   </div>
                 )}
               </section>
+            ) : showSimilarWorkspace ? (
+              <>
+                <section className="group-browser-column similar-search-column">
+                  <div className="group-browser-header">
+                    <div className="group-browser-title">
+                      <strong>{TEXT.similarSearchResult}</strong>
+                      <span>{`${similarSearchResultPhotos.length} / 10`}</span>
+                    </div>
+                    <div className="group-browser-actions">
+                      <button
+                        type="button"
+                        className="move-group-button export-group-button"
+                        onClick={returnToGroupView}
+                      >
+                        <ArrowLeft size={14} />
+                        返回图库
+                      </button>
+                      <button
+                        type="button"
+                        className="move-group-button export-group-button"
+                        onClick={openSimilarSearch}
+                        disabled={similarSearchLoading || !currentArtist}
+                      >
+                        <Upload size={14} />
+                        更换参考图
+                      </button>
+                    </div>
+                  </div>
+
+                  {similarSearchLoading ? (
+                    <div className="group-browser-empty">
+                      <strong>{similarSearchLoadingMessage}</strong>
+                      <p>正在和当前摄影师图库中的图片做相似度对比。</p>
+                    </div>
+                  ) : similarSearchResultPhotos.length > 0 ? (
+                    <div className="similar-search-grid">
+                      {similarSearchResultPhotos.map(({ photo, score }) => (
+                        <div key={photo.path} className="similar-search-card">
+                          <button
+                            type="button"
+                            className="similar-search-thumb"
+                            onClick={() => {
+                              setSelectedPhotoPath(photo.path);
+                              setActiveGroupId(photo.groupId ?? "unassigned");
+                              setWorkspaceView("detail");
+                            }}
+                          >
+                            <img src={photo.previewSrc} alt={photo.name} />
+                            <span className="similar-search-score">{`${score}%`}</span>
+                          </button>
+                          <div className="similar-search-meta">
+                            <strong title={photo.name}>{photo.name}</strong>
+                            <span>{photo.groupId ? currentArtistGroups.find((group) => group.id === photo.groupId)?.name ?? TEXT.ungrouped : TEXT.ungrouped}</span>
+                          </div>
+                          <div className="similar-search-group-actions">
+                            <button
+                              type="button"
+                              className={`tag-chip ${photo.groupId === null ? "active" : ""}`}
+                              onClick={() => assignPhotoByPathToGroup(photo.path, null)}
+                            >
+                              {TEXT.ungrouped}
+                            </button>
+                            {currentArtistGroups.map((group) => (
+                              <button
+                                key={`${photo.path}-${group.id}`}
+                                type="button"
+                                className={`tag-chip ${photo.groupId === group.id ? "active" : ""}`}
+                                onClick={() => assignPhotoByPathToGroup(photo.path, group.id)}
+                              >
+                                {group.name}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="group-browser-empty">
+                      <strong>{similarSearchReferenceSrc ? TEXT.similarSearchNoResult : TEXT.similarSearchEmpty}</strong>
+                      <p>
+                        {similarSearchReferenceSrc
+                          ? "可以换一张参考图重新搜索，或者切换到别的摄影师继续查找。"
+                          : "上传一张参考图后，我们会在当前摄影师的全部图库里做相似比对。"}
+                      </p>
+                    </div>
+                  )}
+                </section>
+              </>
             ) : (
               <>
                 <aside className="detail-side-column detail-left-column">
@@ -2546,7 +3011,9 @@ function App() {
             )}
 
             <aside
-              className={`info-column ${showGroupWorkspace ? "group-note-column" : "detail-right-column"}`}
+              className={`info-column ${
+                showGroupWorkspace || showSimilarWorkspace ? "group-note-column" : "detail-right-column"
+              }`}
             >
               {showGroupWorkspace ? (
                 <section className="info-block">
@@ -2561,6 +3028,23 @@ function App() {
                     disabled={!currentArtist}
                     placeholder="在这里记录这个分组的风格、用光、颜色、构图或者你想记住的关键词。"
                   />
+                </section>
+              ) : showSimilarWorkspace ? (
+                <section className="info-block">
+                  <div className="info-block-header">
+                    <h4>REFERENCE</h4>
+                  </div>
+                  {similarSearchReferenceSrc ? (
+                    <div className="similar-reference-card">
+                      <img src={similarSearchReferenceSrc} alt={similarSearchReferenceName || "参考图"} />
+                      <div className="similar-reference-meta">
+                        <strong>{similarSearchReferenceName || "参考图"}</strong>
+                        <span>{currentArtist ? `在 ${currentArtist} 的图库中查找 Top 10` : "未选择摄影师"}</span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="info-empty">{TEXT.similarSearchEmpty}</div>
+                  )}
                 </section>
               ) : (
                 <>
@@ -2898,6 +3382,90 @@ function App() {
           updatePaletteTone(paletteEditIndex, event.currentTarget.value);
         }}
       />
+      <input
+        ref={similarSearchInputRef}
+        className="visually-hidden"
+        type="file"
+        accept="image/*"
+        onChange={(event) => void handleSimilarSearchFile(event)}
+      />
+
+      {similaritySettingsOpen ? (
+        <div className="modal-overlay" onClick={closeSimilaritySettingsDialog} role="presentation">
+          <div
+            className="modal-card settings-modal"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+          >
+            <h3>{TEXT.similaritySettings}</h3>
+            <p className="modal-subtitle">设置相似搜索的后台线程数和采样数，保存后会自动按新配置预热缓存。</p>
+            <div className="settings-form">
+              <label className="settings-field">
+                <span>{TEXT.similarityThreadCount}</span>
+                <select
+                  value={similaritySettingsDraft.threadCount}
+                  onChange={(event) =>
+                    setSimilaritySettingsDraft((previous) => ({
+                      ...previous,
+                      threadCount: Number(event.currentTarget.value),
+                    }))
+                  }
+                >
+                  {SIMILARITY_THREAD_OPTIONS.map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="settings-field">
+                <span>{TEXT.similaritySampleSize}</span>
+                <select
+                  value={similaritySettingsDraft.sampleSize}
+                  onChange={(event) =>
+                    setSimilaritySettingsDraft((previous) => ({
+                      ...previous,
+                      sampleSize: Number(event.currentTarget.value),
+                    }))
+                  }
+                >
+                  {SIMILARITY_SAMPLE_OPTIONS.map((value) => (
+                    <option key={value} value={value}>
+                      {value}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            {similarityPreheatProgress && currentArtist ? (
+              <p className="modal-subtitle">
+                {similarityPreheatProgress.photographerName === currentArtist
+                  ? `${similarityPreheatProgress.completed ? TEXT.similarityCacheReady : TEXT.similarityCacheBuilding} ${similarityPreheatProgress.processed}/${similarityPreheatProgress.total}`
+                  : ""}
+              </p>
+            ) : null}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="modal-secondary"
+                onClick={closeSimilaritySettingsDialog}
+                disabled={similaritySettingsSaving}
+              >
+                {TEXT.cancel}
+              </button>
+              <button
+                type="button"
+                className="modal-primary"
+                onClick={() => void saveSimilaritySettingsDialog()}
+                disabled={similaritySettingsSaving}
+              >
+                {similaritySettingsSaving ? "保存中..." : "保存设置"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {moveDialogOpen ? (
         <div className="modal-overlay" onClick={closeMoveDialog} role="presentation">
@@ -3028,6 +3596,42 @@ function App() {
                 取消
               </button>
               <button type="button" className="modal-primary" onClick={() => void confirmRenameArtist()}>
+                确认重命名
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {renameGroupTarget ? (
+        <div className="modal-overlay" onClick={closeRenameGroupDialog} role="presentation">
+          <div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+          >
+            <h3>重命名分组</h3>
+            <p className="modal-subtitle">{`${renameGroupTarget.photographerName} / ${renameGroupTarget.name}`}</p>
+            <input
+              autoFocus
+              value={renameGroupValue}
+              onChange={(event) => setRenameGroupValue(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  confirmRenameGroup();
+                }
+                if (event.key === "Escape") {
+                  closeRenameGroupDialog();
+                }
+              }}
+              placeholder="输入新的分组名字"
+            />
+            <div className="modal-actions">
+              <button type="button" className="modal-secondary" onClick={closeRenameGroupDialog}>
+                取消
+              </button>
+              <button type="button" className="modal-primary" onClick={confirmRenameGroup}>
                 确认重命名
               </button>
             </div>

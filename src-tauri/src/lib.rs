@@ -5,19 +5,28 @@ use std::{
     hash::{Hash, Hasher},
     io,
     path::{Component, Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::UNIX_EPOCH,
 };
 
-use image::{DynamicImage, GenericImageView};
+use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use rfd::FileDialog;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
 const APP_STATE_FILE: &str = "app_state.json";
 const APP_DB_FILE: &str = "app_state.sqlite3";
+const SIMILARITY_FEATURE_VERSION: i64 = 1;
+const SIMILARITY_SETTINGS_THREAD_KEY: &str = "similarity_thread_count";
+const SIMILARITY_SETTINGS_SAMPLE_KEY: &str = "similarity_sample_size";
 const IMAGE_EXTENSIONS: [&str; 9] = ["jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff", "avif"];
 const DEFAULT_FALLBACK_PALETTE: [&str; 6] = [
     "#d9b08c",
@@ -185,6 +194,64 @@ struct DedupePhotosResponse {
     state: FrontendState,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SimilarityFeature {
+    color_bins: Vec<f32>,
+    luminance_bins: Vec<f32>,
+    average_color: [f32; 3],
+    aspect_ratio: f32,
+}
+
+#[derive(Debug, Clone)]
+struct CachedSimilarityFeature {
+    feature: SimilarityFeature,
+    feature_version: i64,
+    sample_size: i64,
+    source_mtime: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SimilaritySearchSettings {
+    thread_count: usize,
+    sample_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SimilarSearchResultPayload {
+    path: String,
+    score: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SimilarSearchResponse {
+    results: Vec<SimilarSearchResultPayload>,
+    total: usize,
+    cached_count: usize,
+    computed_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SimilarityPreheatProgressPayload {
+    photographer_name: String,
+    processed: usize,
+    total: usize,
+    cached_count: usize,
+    computed_count: usize,
+    completed: bool,
+    cancelled: bool,
+}
+
+#[derive(Clone, Default)]
+struct SimilarityRuntime {
+    generation: Arc<AtomicU64>,
+    progress: Arc<Mutex<HashMap<String, SimilarityPreheatProgressPayload>>>,
+}
+
 #[tauri::command]
 fn load_app_state(app: AppHandle) -> Result<FrontendState, String> {
     let state = load_state(&app)?;
@@ -249,6 +316,135 @@ fn hide_photos(app: AppHandle, photo_paths: Vec<String>) -> Result<FrontendState
 
     save_state(&app, &state)?;
     build_frontend_state(load_state(&app)?)
+}
+
+#[tauri::command]
+fn get_similarity_search_settings(app: AppHandle) -> Result<SimilaritySearchSettings, String> {
+    load_similarity_settings(&app)
+}
+
+#[tauri::command]
+fn save_similarity_search_settings(
+    app: AppHandle,
+    thread_count: usize,
+    sample_size: u32,
+) -> Result<SimilaritySearchSettings, String> {
+    let settings = normalize_similarity_settings(thread_count, sample_size);
+    store_similarity_settings(&app, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn get_similarity_preheat_status(
+    photographer_name: String,
+    runtime: State<'_, SimilarityRuntime>,
+) -> Result<Option<SimilarityPreheatProgressPayload>, String> {
+    let progress = runtime.progress.lock().map_err(|err| err.to_string())?;
+    Ok(progress.get(&photographer_name).cloned())
+}
+
+#[tauri::command]
+fn cancel_similarity_preheat(
+    photographer_name: Option<String>,
+    runtime: State<'_, SimilarityRuntime>,
+) -> Result<(), String> {
+    runtime.generation.fetch_add(1, Ordering::SeqCst);
+    if let Some(name) = photographer_name {
+        if let Ok(mut progress) = runtime.progress.lock() {
+            if let Some(entry) = progress.get_mut(&name) {
+                entry.cancelled = true;
+                entry.completed = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn preheat_similarity_features(
+    app: AppHandle,
+    photographer_name: String,
+    photo_paths: Vec<String>,
+    runtime: State<'_, SimilarityRuntime>,
+) -> Result<(), String> {
+    if photographer_name.trim().is_empty() || photo_paths.is_empty() {
+        return Ok(());
+    }
+
+    let settings = load_similarity_settings(&app)?;
+    let runtime_handle = runtime.inner().clone();
+    let run_id = runtime_handle.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let app_handle = app.clone();
+
+    std::thread::spawn(move || {
+        let result = execute_similarity_preheat(
+            &app_handle,
+            &photographer_name,
+            &photo_paths,
+            &settings,
+            &runtime_handle,
+            run_id,
+        );
+
+        if let Err(error) = result {
+            let payload = SimilarityPreheatProgressPayload {
+                photographer_name: photographer_name.clone(),
+                processed: 0,
+                total: photo_paths.len(),
+                cached_count: 0,
+                computed_count: 0,
+                completed: true,
+                cancelled: false,
+            };
+            if let Ok(mut progress) = runtime_handle.progress.lock() {
+                progress.insert(photographer_name.clone(), payload.clone());
+            }
+            let _ = app_handle.emit("similarity-preheat-progress", payload);
+            let _ = app_handle.emit("similarity-preheat-error", error);
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn search_similar_photos(
+    app: AppHandle,
+    reference_bytes: Vec<u8>,
+    photo_paths: Vec<String>,
+) -> Result<SimilarSearchResponse, String> {
+    if reference_bytes.is_empty() {
+        return Ok(SimilarSearchResponse {
+            results: Vec::new(),
+            total: 0,
+            cached_count: 0,
+            computed_count: 0,
+        });
+    }
+
+    let settings = load_similarity_settings(&app)?;
+    let reference_feature = extract_similarity_feature_from_bytes(&reference_bytes, settings.sample_size)?
+        .ok_or_else(|| "参考图读取失败".to_string())?;
+    let (features, cached_count, computed_count) =
+        ensure_similarity_features(&app, &photo_paths, &settings)?;
+
+    let mut results: Vec<SimilarSearchResultPayload> = features
+        .into_iter()
+        .map(|(path, feature)| SimilarSearchResultPayload {
+            path,
+            score: calculate_similarity_score(&reference_feature, &feature),
+        })
+        .collect();
+
+    results.sort_by(|left, right| right.score.cmp(&left.score));
+    results.truncate(10);
+
+    Ok(SimilarSearchResponse {
+        total: photo_paths.len(),
+        results,
+        cached_count,
+        computed_count,
+    })
 }
 
 #[tauri::command]
@@ -809,6 +1005,448 @@ fn default_photo_meta(seed: &str) -> StoredPhotoMeta {
     }
 }
 
+fn default_similarity_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get().saturating_sub(1))
+        .unwrap_or(3)
+        .clamp(1, 8)
+}
+
+fn normalize_similarity_settings(thread_count: usize, sample_size: u32) -> SimilaritySearchSettings {
+    let normalized_sample = match sample_size {
+        32 | 48 | 56 | 64 | 80 => sample_size,
+        _ => 56,
+    };
+
+    SimilaritySearchSettings {
+        thread_count: thread_count.clamp(1, 8),
+        sample_size: normalized_sample,
+    }
+}
+
+fn load_similarity_settings(app: &AppHandle) -> Result<SimilaritySearchSettings, String> {
+    let connection = open_database(app)?;
+    let thread_count = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![SIMILARITY_SETTINGS_THREAD_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(default_similarity_thread_count);
+
+    let sample_size = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![SIMILARITY_SETTINGS_SAMPLE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(56);
+
+    Ok(normalize_similarity_settings(thread_count, sample_size))
+}
+
+fn store_similarity_settings(app: &AppHandle, settings: &SimilaritySearchSettings) -> Result<(), String> {
+    let connection = open_database(app)?;
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![SIMILARITY_SETTINGS_THREAD_KEY, settings.thread_count.to_string()],
+        )
+        .map_err(|err| err.to_string())?;
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![SIMILARITY_SETTINGS_SAMPLE_KEY, settings.sample_size.to_string()],
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+fn current_unix_timestamp() -> i64 {
+    UNIX_EPOCH
+        .elapsed()
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn file_modified_timestamp(path: &Path) -> Result<i64, String> {
+    let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
+    let modified = metadata.modified().map_err(|err| err.to_string())?;
+    let duration = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| err.to_string())?;
+    Ok(duration.as_secs() as i64)
+}
+
+fn extract_similarity_feature_from_path(
+    path: &Path,
+    sample_size: u32,
+) -> Result<Option<SimilarityFeature>, String> {
+    let reader = image::ImageReader::open(path).map_err(|err| err.to_string())?;
+    let reader = reader.with_guessed_format().map_err(|err| err.to_string())?;
+    let image = reader.decode().map_err(|err| err.to_string())?;
+    Ok(build_similarity_feature_from_image(&image, sample_size))
+}
+
+fn extract_similarity_feature_from_bytes(
+    bytes: &[u8],
+    sample_size: u32,
+) -> Result<Option<SimilarityFeature>, String> {
+    let image = image::load_from_memory(bytes).map_err(|err| err.to_string())?;
+    Ok(build_similarity_feature_from_image(&image, sample_size))
+}
+
+fn build_similarity_feature_from_image(
+    image: &DynamicImage,
+    sample_size: u32,
+) -> Option<SimilarityFeature> {
+    let (natural_width, natural_height) = image.dimensions();
+    if natural_width == 0 || natural_height == 0 {
+        return None;
+    }
+
+    let resized = if natural_width <= sample_size && natural_height <= sample_size {
+        image.clone()
+    } else {
+        image.resize(sample_size, sample_size, FilterType::Triangle)
+    };
+
+    let rgba = resized.to_rgba8();
+    let color_bin_count = 8usize;
+    let luminance_bin_count = 16usize;
+    let mut color_bins = vec![0f32; color_bin_count * 3];
+    let mut luminance_bins = vec![0f32; luminance_bin_count];
+    let mut total = 0f32;
+    let mut red_sum = 0f32;
+    let mut green_sum = 0f32;
+    let mut blue_sum = 0f32;
+
+    for pixel in rgba.pixels() {
+        if pixel[3] < 8 {
+            continue;
+        }
+
+        let red = pixel[0] as f32;
+        let green = pixel[1] as f32;
+        let blue = pixel[2] as f32;
+        let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+        let red_bin = ((red / 256.0) * color_bin_count as f32)
+            .floor()
+            .clamp(0.0, (color_bin_count - 1) as f32) as usize;
+        let green_bin = ((green / 256.0) * color_bin_count as f32)
+            .floor()
+            .clamp(0.0, (color_bin_count - 1) as f32) as usize;
+        let blue_bin = ((blue / 256.0) * color_bin_count as f32)
+            .floor()
+            .clamp(0.0, (color_bin_count - 1) as f32) as usize;
+        let luminance_bin = ((luminance / 256.0) * luminance_bin_count as f32)
+            .floor()
+            .clamp(0.0, (luminance_bin_count - 1) as f32) as usize;
+
+        color_bins[red_bin] += 1.0;
+        color_bins[color_bin_count + green_bin] += 1.0;
+        color_bins[color_bin_count * 2 + blue_bin] += 1.0;
+        luminance_bins[luminance_bin] += 1.0;
+        total += 1.0;
+        red_sum += red;
+        green_sum += green;
+        blue_sum += blue;
+    }
+
+    if total == 0.0 {
+        return None;
+    }
+
+    Some(SimilarityFeature {
+        color_bins: color_bins.into_iter().map(|value| value / total).collect(),
+        luminance_bins: luminance_bins.into_iter().map(|value| value / total).collect(),
+        average_color: [red_sum / total, green_sum / total, blue_sum / total],
+        aspect_ratio: natural_width as f32 / natural_height as f32,
+    })
+}
+
+fn calculate_similarity_score(left: &SimilarityFeature, right: &SimilarityFeature) -> i32 {
+    let color_distance_score: f32 = left
+        .color_bins
+        .iter()
+        .zip(right.color_bins.iter())
+        .map(|(l, r)| (l - r).abs())
+        .sum();
+    let luminance_distance_score: f32 = left
+        .luminance_bins
+        .iter()
+        .zip(right.luminance_bins.iter())
+        .map(|(l, r)| (l - r).abs())
+        .sum();
+    let average_color_distance =
+        color_distance(left.average_color, right.average_color) / (255.0f32 * 255.0 * 3.0).sqrt();
+    let aspect_distance = (left.aspect_ratio - right.aspect_ratio).abs().min(1.0);
+    let normalized_distance = color_distance_score * 0.48
+        + luminance_distance_score * 0.28
+        + average_color_distance * 0.18
+        + aspect_distance * 0.06;
+
+    ((1.0 - normalized_distance / 3.2).clamp(0.0, 1.0) * 100.0).round() as i32
+}
+
+fn read_cached_similarity_feature(
+    connection: &Connection,
+    path: &str,
+) -> Result<Option<CachedSimilarityFeature>, String> {
+    connection
+        .query_row(
+            "SELECT feature_json, feature_version, sample_size, source_mtime
+             FROM similarity_features
+             WHERE path = ?1",
+            params![path],
+            |row| {
+                let feature_json: String = row.get(0)?;
+                let feature =
+                    serde_json::from_str::<SimilarityFeature>(&feature_json).unwrap_or(SimilarityFeature {
+                        color_bins: Vec::new(),
+                        luminance_bins: Vec::new(),
+                        average_color: [0.0, 0.0, 0.0],
+                        aspect_ratio: 1.0,
+                    });
+                Ok(CachedSimilarityFeature {
+                    feature,
+                    feature_version: row.get(1)?,
+                    sample_size: row.get(2)?,
+                    source_mtime: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| err.to_string())
+}
+
+fn write_similarity_features(
+    connection: &Connection,
+    features: &[(String, SimilarityFeature, i64, u32)],
+) -> Result<(), String> {
+    if features.is_empty() {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction().map_err(|err| err.to_string())?;
+    let updated_at = current_unix_timestamp();
+    for (path, feature, source_mtime, sample_size) in features {
+        let feature_json = serde_json::to_string(feature).map_err(|err| err.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO similarity_features
+                 (path, feature_json, feature_version, sample_size, source_mtime, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    path,
+                    feature_json,
+                    SIMILARITY_FEATURE_VERSION,
+                    *sample_size as i64,
+                    source_mtime,
+                    updated_at
+                ],
+            )
+            .map_err(|err| err.to_string())?;
+    }
+    transaction.commit().map_err(|err| err.to_string())
+}
+
+fn ensure_similarity_features(
+    app: &AppHandle,
+    photo_paths: &[String],
+    settings: &SimilaritySearchSettings,
+) -> Result<(HashMap<String, SimilarityFeature>, usize, usize), String> {
+    let connection = open_database(app)?;
+    let mut ready = HashMap::new();
+    let mut missing = Vec::new();
+
+    for path in photo_paths {
+        let normalized_path = normalize_path_string(path);
+        let path_buf = PathBuf::from(&normalized_path);
+        let Ok(source_mtime) = file_modified_timestamp(&path_buf) else {
+            continue;
+        };
+
+        if let Some(cached) = read_cached_similarity_feature(&connection, &normalized_path)? {
+            if cached.feature_version == SIMILARITY_FEATURE_VERSION
+                && cached.sample_size == settings.sample_size as i64
+                && cached.source_mtime == source_mtime
+                && !cached.feature.color_bins.is_empty()
+            {
+                ready.insert(normalized_path.clone(), cached.feature);
+                continue;
+            }
+        }
+
+        missing.push((normalized_path, path_buf, source_mtime));
+    }
+
+    let cached_count = ready.len();
+    if missing.is_empty() {
+        return Ok((ready, cached_count, 0));
+    }
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(settings.thread_count)
+        .build()
+        .map_err(|err| err.to_string())?;
+    let computed: Vec<(String, SimilarityFeature, i64, u32)> = pool.install(|| {
+        missing
+            .par_iter()
+            .filter_map(|(path, path_buf, source_mtime)| {
+                extract_similarity_feature_from_path(path_buf, settings.sample_size)
+                    .ok()
+                    .flatten()
+                    .map(|feature| (path.clone(), feature, *source_mtime, settings.sample_size))
+            })
+            .collect()
+    });
+
+    write_similarity_features(&connection, &computed)?;
+    for (path, feature, _, _) in &computed {
+        ready.insert(path.clone(), feature.clone());
+    }
+
+    Ok((ready, cached_count, computed.len()))
+}
+
+fn execute_similarity_preheat(
+    app: &AppHandle,
+    photographer_name: &str,
+    photo_paths: &[String],
+    settings: &SimilaritySearchSettings,
+    runtime: &SimilarityRuntime,
+    run_id: u64,
+) -> Result<(), String> {
+    let connection = open_database(app)?;
+    let mut cached_features = HashMap::new();
+    let mut missing = Vec::new();
+
+    for path in photo_paths {
+        let normalized_path = normalize_path_string(path);
+        let path_buf = PathBuf::from(&normalized_path);
+        let Ok(source_mtime) = file_modified_timestamp(&path_buf) else {
+            continue;
+        };
+
+        if let Some(cached) = read_cached_similarity_feature(&connection, &normalized_path)? {
+            if cached.feature_version == SIMILARITY_FEATURE_VERSION
+                && cached.sample_size == settings.sample_size as i64
+                && cached.source_mtime == source_mtime
+                && !cached.feature.color_bins.is_empty()
+            {
+                cached_features.insert(normalized_path.clone(), cached.feature);
+                continue;
+            }
+        }
+
+        missing.push((normalized_path, path_buf, source_mtime));
+    }
+
+    let total = photo_paths.len();
+    let cached_count = cached_features.len();
+    let initial_payload = SimilarityPreheatProgressPayload {
+        photographer_name: photographer_name.to_string(),
+        processed: cached_count,
+        total,
+        cached_count,
+        computed_count: 0,
+        completed: missing.is_empty(),
+        cancelled: false,
+    };
+    if let Ok(mut progress) = runtime.progress.lock() {
+        progress.insert(photographer_name.to_string(), initial_payload.clone());
+    }
+    let _ = app.emit("similarity-preheat-progress", initial_payload.clone());
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let processed = Arc::new(std::sync::atomic::AtomicUsize::new(cached_count));
+    let computed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(settings.thread_count)
+        .build()
+        .map_err(|err| err.to_string())?;
+    let app_handle = app.clone();
+    let progress_map = runtime.progress.clone();
+    let generation = runtime.generation.clone();
+    let photographer = photographer_name.to_string();
+
+    let computed_features: Vec<(String, SimilarityFeature, i64, u32)> = pool.install(|| {
+        missing
+            .par_iter()
+            .filter_map(|(path, path_buf, source_mtime)| {
+                if generation.load(Ordering::SeqCst) != run_id {
+                    return None;
+                }
+
+                let feature = extract_similarity_feature_from_path(path_buf, settings.sample_size)
+                    .ok()
+                    .flatten()?;
+                let next_processed = processed.fetch_add(1, Ordering::SeqCst) + 1;
+                let next_computed = computed.fetch_add(1, Ordering::SeqCst) + 1;
+                if next_processed == total || next_computed % 12 == 0 {
+                    let payload = SimilarityPreheatProgressPayload {
+                        photographer_name: photographer.clone(),
+                        processed: next_processed,
+                        total,
+                        cached_count,
+                        computed_count: next_computed,
+                        completed: false,
+                        cancelled: false,
+                    };
+                    if let Ok(mut progress) = progress_map.lock() {
+                        progress.insert(photographer.clone(), payload.clone());
+                    }
+                    let _ = app_handle.emit("similarity-preheat-progress", payload);
+                }
+                Some((path.clone(), feature, *source_mtime, settings.sample_size))
+            })
+            .collect()
+    });
+
+    if generation.load(Ordering::SeqCst) != run_id {
+        let payload = SimilarityPreheatProgressPayload {
+            photographer_name: photographer_name.to_string(),
+            processed: processed.load(Ordering::SeqCst),
+            total,
+            cached_count,
+            computed_count: computed.load(Ordering::SeqCst),
+            completed: true,
+            cancelled: true,
+        };
+        if let Ok(mut progress) = runtime.progress.lock() {
+            progress.insert(photographer_name.to_string(), payload.clone());
+        }
+        let _ = app.emit("similarity-preheat-progress", payload);
+        return Ok(());
+    }
+
+    write_similarity_features(&connection, &computed_features)?;
+    let payload = SimilarityPreheatProgressPayload {
+        photographer_name: photographer_name.to_string(),
+        processed: cached_count + computed_features.len(),
+        total,
+        cached_count,
+        computed_count: computed_features.len(),
+        completed: true,
+        cancelled: false,
+    };
+    if let Ok(mut progress) = runtime.progress.lock() {
+        progress.insert(photographer_name.to_string(), payload.clone());
+    }
+    let _ = app.emit("similarity-preheat-progress", payload);
+    Ok(())
+}
+
 fn fallback_palette() -> Vec<String> {
     DEFAULT_FALLBACK_PALETTE
         .iter()
@@ -1165,6 +1803,15 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
                 target_dir TEXT NOT NULL,
                 extracted_files INTEGER NOT NULL,
                 created_new_photographer INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS similarity_features (
+                path TEXT PRIMARY KEY,
+                feature_json TEXT NOT NULL,
+                feature_version INTEGER NOT NULL,
+                sample_size INTEGER NOT NULL,
+                source_mtime INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
             );
             ",
         )
@@ -1582,10 +2229,17 @@ fn strip_common_prefix(path: &Path, prefix: Option<&Path>) -> PathBuf {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(SimilarityRuntime::default())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             load_app_state,
             save_app_state,
+            get_similarity_search_settings,
+            save_similarity_search_settings,
+            get_similarity_preheat_status,
+            cancel_similarity_preheat,
+            preheat_similarity_features,
+            search_similar_photos,
             import_image_directory,
             preview_archive_import,
             import_archive,

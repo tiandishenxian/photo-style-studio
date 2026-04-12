@@ -27,3 +27,4 @@ zip = "2"
 walkdir = "2"
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+rayon = "1.10"

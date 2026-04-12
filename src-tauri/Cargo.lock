@@ -3232,6 +3232,7 @@ name = "photo-style-studio"
 version = "0.1.0"
 dependencies = [
  "image",
+ "rayon",
  "rfd",
  "rusqlite",
  "serde",
