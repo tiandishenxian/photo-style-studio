@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::UNIX_EPOCH,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
@@ -57,6 +57,8 @@ struct StoredGroup {
 #[serde(rename_all = "camelCase")]
 struct StoredPhotoMeta {
     group_id: Option<String>,
+    #[serde(default)]
+    sort_index: Option<i64>,
     tags: Vec<String>,
     palette: Vec<String>,
     mood: String,
@@ -80,6 +82,8 @@ struct StoredPhoto {
     origin_path: String,
     photographer_name: String,
     group_id: Option<String>,
+    #[serde(default)]
+    sort_index: Option<i64>,
     tags: Vec<String>,
     palette: Vec<String>,
     mood: String,
@@ -283,6 +287,7 @@ fn save_app_state(app: AppHandle, payload: SaveStatePayload) -> Result<(), Strin
             normalized_path,
             StoredPhotoMeta {
                 group_id: photo.group_id,
+                sort_index: photo.sort_index,
                 tags: photo.tags,
                 palette: photo.palette,
                 mood: photo.mood,
@@ -312,6 +317,70 @@ fn hide_photos(app: AppHandle, photo_paths: Vec<String>) -> Result<FrontendState
             .entry(normalized_path.clone())
             .or_insert_with(|| default_photo_meta(&normalized_path));
         meta.hidden_manual = true;
+    }
+
+    save_state(&app, &state)?;
+    build_frontend_state(load_state(&app)?)
+}
+
+fn next_group_sort_index(state: &AppState, group_id: &str) -> i64 {
+    state
+        .photo_metadata
+        .values()
+        .filter(|meta| meta.group_id.as_deref() == Some(group_id))
+        .filter_map(|meta| meta.sort_index)
+        .max()
+        .map(|value| value + 1)
+        .unwrap_or(0)
+}
+
+#[tauri::command]
+fn save_group_photo_order(
+    app: AppHandle,
+    photographer_name: String,
+    group_id: String,
+    ordered_photo_paths: Vec<String>,
+) -> Result<FrontendState, String> {
+    if ordered_photo_paths.is_empty() {
+        return build_frontend_state(load_state(&app)?);
+    }
+
+    let mut state = load_state(&app)?;
+    let group_exists = state
+        .groups
+        .iter()
+        .any(|group| group.id == group_id && group.photographer_name == photographer_name);
+    if !group_exists {
+        return Err("目标分组不存在，无法保存排序".to_string());
+    }
+
+    let mut normalized_paths = Vec::new();
+    let mut seen = HashSet::new();
+    for path in ordered_photo_paths {
+        let normalized = normalize_path_string(&path);
+        if seen.insert(normalized.clone()) {
+            normalized_paths.push(normalized);
+        }
+    }
+
+    let mut remainder: Vec<String> = state
+        .photo_metadata
+        .iter()
+        .filter(|(path, meta)| {
+            meta.group_id.as_deref() == Some(group_id.as_str()) && !seen.contains(*path)
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    remainder.sort();
+    normalized_paths.extend(remainder);
+
+    for (index, path) in normalized_paths.iter().enumerate() {
+        let meta = state
+            .photo_metadata
+            .entry(path.clone())
+            .or_insert_with(|| default_photo_meta(path));
+        meta.group_id = Some(group_id.clone());
+        meta.sort_index = Some(index as i64);
     }
 
     save_state(&app, &state)?;
@@ -445,6 +514,117 @@ fn search_similar_photos(
         cached_count,
         computed_count,
     })
+}
+
+fn sanitize_import_stem(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    sanitized
+        .trim_matches('-')
+        .chars()
+        .take(48)
+        .collect::<String>()
+}
+
+fn infer_image_extension(original_file_name: &str, mime_type: Option<&str>) -> String {
+    let from_name = Path::new(original_file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+
+    if let Some(extension) = from_name {
+        if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+            return match extension.as_str() {
+                "jpeg" => "jpg".to_string(),
+                other => other.to_string(),
+            };
+        }
+    }
+
+    match mime_type.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "image/jpeg" => "jpg".to_string(),
+        "image/png" => "png".to_string(),
+        "image/webp" => "webp".to_string(),
+        "image/bmp" => "bmp".to_string(),
+        "image/gif" => "gif".to_string(),
+        "image/tiff" => "tiff".to_string(),
+        "image/avif" => "avif".to_string(),
+        _ => "png".to_string(),
+    }
+}
+
+#[tauri::command]
+fn import_reference_image(
+    app: AppHandle,
+    photographer_name: String,
+    target_group_id: Option<String>,
+    reference_bytes: Vec<u8>,
+    original_file_name: String,
+    mime_type: Option<String>,
+) -> Result<FrontendState, String> {
+    if reference_bytes.is_empty() {
+        return Err("参考图为空，无法加入图库".to_string());
+    }
+
+    let mut state = load_state(&app)?;
+    let library = state
+        .libraries
+        .iter()
+        .find(|entry| entry.photographer_name == photographer_name)
+        .cloned()
+        .ok_or_else(|| "当前摄影师不存在，无法加入图库".to_string())?;
+
+    let import_dir = PathBuf::from(&library.directory).join("imports");
+    fs::create_dir_all(&import_dir).map_err(|err| err.to_string())?;
+
+    let fallback_stem = Path::new(&original_file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("reference");
+    let stem = {
+        let sanitized = sanitize_import_stem(fallback_stem);
+        if sanitized.is_empty() {
+            "reference".to_string()
+        } else {
+            sanitized
+        }
+    };
+    let extension = infer_image_extension(&original_file_name, mime_type.as_deref());
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| err.to_string())?
+        .as_millis();
+
+    let mut target_path = import_dir.join(format!("{stem}-{timestamp}.{extension}"));
+    let mut duplicate_index = 1usize;
+    while target_path.exists() {
+        target_path = import_dir.join(format!("{stem}-{timestamp}-{duplicate_index}.{extension}"));
+        duplicate_index += 1;
+    }
+
+    fs::write(&target_path, &reference_bytes).map_err(|err| err.to_string())?;
+    let normalized_path = normalize_path_string(&target_path.to_string_lossy());
+    let mut meta = state
+        .photo_metadata
+        .remove(&normalized_path)
+        .unwrap_or_else(|| default_photo_meta(&normalized_path));
+    meta.group_id = target_group_id.clone();
+    meta.sort_index = target_group_id
+        .as_deref()
+        .map(|group_id| next_group_sort_index(&state, group_id));
+    state.photo_metadata.insert(normalized_path, meta);
+
+    save_state(&app, &state)?;
+    build_frontend_state(load_state(&app)?)
 }
 
 #[tauri::command]
@@ -920,6 +1100,7 @@ fn build_frontend_state(state: AppState) -> Result<FrontendState, String> {
                     origin_path,
                     photographer_name: library.photographer_name.clone(),
                     group_id: meta.group_id,
+                    sort_index: meta.sort_index,
                     tags: meta.tags,
                     palette,
                     mood: meta.mood,
@@ -994,6 +1175,7 @@ fn default_photo_meta(seed: &str) -> StoredPhotoMeta {
 
     StoredPhotoMeta {
         group_id: None,
+        sort_index: None,
         tags: Vec::new(),
         palette: Vec::new(),
         mood: moods[mood_index].to_string(),
@@ -1762,6 +1944,7 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
             CREATE TABLE IF NOT EXISTS photo_metadata (
                 path TEXT PRIMARY KEY,
                 group_id TEXT,
+                sort_index INTEGER,
                 tags_json TEXT NOT NULL,
                 palette_json TEXT NOT NULL,
                 mood TEXT NOT NULL,
@@ -1817,6 +2000,10 @@ fn initialize_database(connection: &Connection) -> Result<(), String> {
         )
         .map_err(|err| err.to_string())?;
 
+    let _ = connection.execute(
+        "ALTER TABLE photo_metadata ADD COLUMN sort_index INTEGER",
+        [],
+    );
     let _ = connection.execute(
         "ALTER TABLE photo_metadata ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
         [],
@@ -1907,26 +2094,27 @@ fn read_full_state(connection: &Connection) -> Result<AppState, String> {
 
     let mut metadata_statement = connection
         .prepare(
-            "SELECT path, group_id, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate, hidden_manual
+            "SELECT path, group_id, sort_index, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate, hidden_manual
              FROM photo_metadata",
         )
         .map_err(|err| err.to_string())?;
     let photo_metadata = metadata_statement
         .query_map([], |row| {
-            let tags_json: String = row.get(2)?;
-            let palette_json: String = row.get(3)?;
+            let tags_json: String = row.get(3)?;
+            let palette_json: String = row.get(4)?;
             Ok((
                 row.get::<_, String>(0)?,
                 StoredPhotoMeta {
                     group_id: row.get(1)?,
+                    sort_index: row.get(2).ok(),
                     tags: serde_json::from_str(&tags_json).unwrap_or_default(),
                     palette: serde_json::from_str(&palette_json).unwrap_or_default(),
-                    mood: row.get(4)?,
-                    summary: row.get(5)?,
-                    starred: row.get::<_, i64>(6).unwrap_or(0) != 0,
-                    content_hash: row.get(7).ok(),
-                    hidden_duplicate: row.get::<_, i64>(8).unwrap_or(0) != 0,
-                    hidden_manual: row.get::<_, i64>(9).unwrap_or(0) != 0,
+                    mood: row.get(5)?,
+                    summary: row.get(6)?,
+                    starred: row.get::<_, i64>(7).unwrap_or(0) != 0,
+                    content_hash: row.get(8).ok(),
+                    hidden_duplicate: row.get::<_, i64>(9).unwrap_or(0) != 0,
+                    hidden_manual: row.get::<_, i64>(10).unwrap_or(0) != 0,
                 },
             ))
         })
@@ -2041,11 +2229,12 @@ fn write_full_state(connection: &Connection, state: &AppState) -> Result<(), Str
         let palette_json = serde_json::to_string(&meta.palette).map_err(|err| err.to_string())?;
         transaction
             .execute(
-                "INSERT INTO photo_metadata (path, group_id, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate, hidden_manual)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO photo_metadata (path, group_id, sort_index, tags_json, palette_json, mood, summary, starred, content_hash, hidden_duplicate, hidden_manual)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     path,
                     meta.group_id,
+                    meta.sort_index,
                     tags_json,
                     palette_json,
                     meta.mood,
@@ -2240,9 +2429,11 @@ pub fn run() {
             cancel_similarity_preheat,
             preheat_similarity_features,
             search_similar_photos,
+            import_reference_image,
             import_image_directory,
             preview_archive_import,
             import_archive,
+            save_group_photo_order,
             rename_photographer,
             extract_photo_palette,
             dedupe_photos_by_content,

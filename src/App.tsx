@@ -5,6 +5,7 @@
   useRef,
   useState,
   type ChangeEvent,
+  type PointerEvent as ReactPointerEvent,
   type UIEvent as ReactUIEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
@@ -39,6 +40,7 @@ type PhotoItem = {
   originPath: string;
   photographerName: string;
   groupId: string | null;
+  sortIndex?: number | null;
   tags: string[];
   palette: string[];
   mood: string;
@@ -178,6 +180,11 @@ type SimilarSearchResponse = {
 type SimilaritySearchSettings = {
   threadCount: number;
   sampleSize: number;
+};
+
+type SimilarSearchReferencePayload = {
+  bytes: number[];
+  mimeType: string;
 };
 
 type SimilarityPreheatProgress = {
@@ -636,6 +643,9 @@ function App() {
   const [workspaceView, setWorkspaceView] = useState<WorkspaceView>("group");
   const [thumbnailScale, setThumbnailScale] = useState<ThumbnailScale>("medium");
   const [selectedGroupPhotoPaths, setSelectedGroupPhotoPaths] = useState<string[]>([]);
+  const [draggingGroupPhotoPath, setDraggingGroupPhotoPath] = useState<string | null>(null);
+  const [dragOverGroupPhotoPath, setDragOverGroupPhotoPath] = useState<string | null>(null);
+  const [dragOverPosition, setDragOverPosition] = useState<"before" | "after" | null>(null);
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [exportMode, setExportMode] = useState<ExportMode>("all");
   const [moveDialogOpen, setMoveDialogOpen] = useState(false);
@@ -647,6 +657,10 @@ function App() {
   const [renameGroupValue, setRenameGroupValue] = useState("");
   const [similarSearchReferenceName, setSimilarSearchReferenceName] = useState("");
   const [similarSearchReferenceSrc, setSimilarSearchReferenceSrc] = useState<string | null>(null);
+  const [similarSearchReferencePayload, setSimilarSearchReferencePayload] =
+    useState<SimilarSearchReferencePayload | null>(null);
+  const [similarSearchImportGroupId, setSimilarSearchImportGroupId] = useState<string>("");
+  const [similarSearchImporting, setSimilarSearchImporting] = useState(false);
   const [similarSearchLoading, setSimilarSearchLoading] = useState(false);
   const [similarSearchLoadingMessage, setSimilarSearchLoadingMessage] = useState(
     TEXT.similarSearchLoading,
@@ -703,6 +717,13 @@ function App() {
   const paletteHydrationRef = useRef<Set<string>>(new Set());
   const currentArtistRef = useRef<string | null>(null);
   const currentArtistPhotosRef = useRef<PhotoItem[]>([]);
+  const suppressGroupClickRef = useRef(false);
+  const reorderMovedRef = useRef(false);
+  const draggingGroupPhotoPathRef = useRef<string | null>(null);
+  const dragOverGroupPhotoPathRef = useRef<string | null>(null);
+  const dragOverPositionRef = useRef<"before" | "after" | null>(null);
+  const visiblePhotoPathsRef = useRef<string[]>([]);
+  const canReorderGroupPhotosRef = useRef(false);
   const groupScrollTopRef = useRef(0);
   const restorePromptTimerRef = useRef<number | null>(null);
   const pendingScrollSaveTimerRef = useRef<number | null>(null);
@@ -966,6 +987,10 @@ function App() {
     similaritySettings.threadCount,
   ]);
 
+  useEffect(() => {
+    setSimilarSearchImportGroupId("");
+  }, [currentArtist, similarSearchReferenceName]);
+
   const similarSearchResultPhotos = useMemo(() => {
     const lookup = new Map(currentArtistPhotos.map((photo) => [photo.path, photo]));
     return similarSearchResults
@@ -992,13 +1017,56 @@ function App() {
       return currentArtistPhotos.filter((photo) => !photo.groupId);
     }
 
-    return currentArtistPhotos.filter((photo) => photo.groupId === activeGroupId);
+    return currentArtistPhotos
+      .filter((photo) => photo.groupId === activeGroupId)
+      .map((photo, index) => ({ photo, index }))
+      .sort((left, right) => {
+        const leftSort = left.photo.sortIndex;
+        const rightSort = right.photo.sortIndex;
+        if (leftSort != null && rightSort != null && leftSort !== rightSort) {
+          return leftSort - rightSort;
+        }
+        if (leftSort != null && rightSort == null) {
+          return -1;
+        }
+        if (leftSort == null && rightSort != null) {
+          return 1;
+        }
+        return left.index - right.index;
+      })
+      .map(({ photo }) => photo);
   }, [activeGroupId, currentArtistPhotos]);
 
   const starredVisiblePhotos = useMemo(
     () => visiblePhotos.filter((photo) => photo.starred),
     [visiblePhotos],
   );
+
+  const canReorderGroupPhotos =
+    workspaceView === "group" &&
+    activeGroupId !== "all" &&
+    activeGroupId !== "unassigned" &&
+    selectedGroupPhotoPaths.length === 0;
+
+  useEffect(() => {
+    canReorderGroupPhotosRef.current = canReorderGroupPhotos;
+  }, [canReorderGroupPhotos]);
+
+  useEffect(() => {
+    visiblePhotoPathsRef.current = visiblePhotos.map((photo) => photo.path);
+  }, [visiblePhotos]);
+
+  useEffect(() => {
+    draggingGroupPhotoPathRef.current = draggingGroupPhotoPath;
+  }, [draggingGroupPhotoPath]);
+
+  useEffect(() => {
+    dragOverGroupPhotoPathRef.current = dragOverGroupPhotoPath;
+  }, [dragOverGroupPhotoPath]);
+
+  useEffect(() => {
+    dragOverPositionRef.current = dragOverPosition;
+  }, [dragOverPosition]);
 
   useEffect(() => {
     if (visiblePhotos.length === 0) {
@@ -1018,6 +1086,98 @@ function App() {
     setMoveNewGroupName("");
     setMoveTargetGroupId("unassigned");
   }, [activeGroupId, currentArtist]);
+
+  useEffect(() => {
+    if (!canReorderGroupPhotos && (draggingGroupPhotoPath || dragOverGroupPhotoPath)) {
+      resetGroupPhotoDragState();
+    }
+  }, [canReorderGroupPhotos, dragOverGroupPhotoPath, draggingGroupPhotoPath]);
+
+  useEffect(() => {
+    if (!draggingGroupPhotoPath) {
+      return;
+    }
+
+    const updateDropTarget = (clientX: number, clientY: number) => {
+      const draggingPath = draggingGroupPhotoPathRef.current;
+      if (!draggingPath || !canReorderGroupPhotosRef.current) {
+        return;
+      }
+
+      const hovered = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+      const target = hovered?.closest("[data-photo-path]") as HTMLElement | null;
+      if (!target) {
+        return;
+      }
+
+      const targetPath = target.dataset.photoPath;
+      if (!targetPath || targetPath === draggingPath) {
+        return;
+      }
+
+      const rect = target.getBoundingClientRect();
+      const horizontalRatio = (clientX - rect.left) / Math.max(rect.width, 1);
+      const verticalRatio = (clientY - rect.top) / Math.max(rect.height, 1);
+      const useBefore =
+        horizontalRatio < 0.5 && (horizontalRatio < verticalRatio || horizontalRatio < 1 - verticalRatio);
+      const nextPosition: "before" | "after" = useBefore ? "before" : "after";
+
+      if (
+        dragOverGroupPhotoPathRef.current !== targetPath ||
+        dragOverPositionRef.current !== nextPosition
+      ) {
+        setDragOverGroupPhotoPath(targetPath);
+        setDragOverPosition(nextPosition);
+      }
+      reorderMovedRef.current = true;
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
+      updateDropTarget(event.clientX, event.clientY);
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      const draggingPath = draggingGroupPhotoPathRef.current;
+      const targetPath = dragOverGroupPhotoPathRef.current;
+      const position = dragOverPositionRef.current;
+
+      if (
+        canReorderGroupPhotosRef.current &&
+        draggingPath &&
+        targetPath &&
+        position &&
+        reorderMovedRef.current &&
+        draggingPath !== targetPath
+      ) {
+        updateDropTarget(event.clientX, event.clientY);
+        const resolvedTargetPath = dragOverGroupPhotoPathRef.current ?? targetPath;
+        const resolvedPosition = dragOverPositionRef.current ?? position;
+        suppressGroupClickRef.current = true;
+        window.setTimeout(() => {
+          suppressGroupClickRef.current = false;
+        }, 0);
+        const nextOrder = reorderVisiblePaths(
+          visiblePhotoPathsRef.current,
+          draggingPath,
+          resolvedTargetPath,
+          resolvedPosition,
+        );
+        void persistCurrentGroupOrder(nextOrder);
+      }
+
+      reorderMovedRef.current = false;
+      resetGroupPhotoDragState();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+    };
+  }, [draggingGroupPhotoPath]);
 
   useEffect(() => {
     return () => {
@@ -1638,7 +1798,7 @@ function App() {
       }
       setPhotos((previous) =>
         previous.map((photo) =>
-          photo.groupId === groupId ? { ...photo, groupId: null } : photo,
+          photo.groupId === groupId ? { ...photo, groupId: null, sortIndex: null } : photo,
         ),
       );
       if (activeGroupId === groupId) {
@@ -1714,12 +1874,23 @@ function App() {
     assignPhotoByPathToGroup(selectedPhoto.path, groupId);
   }
 
-  function assignPhotoByPathToGroup(photoPath: string, groupId: string | null) {
-    setPhotos((previous) =>
-      previous.map((photo) =>
-        photo.path === photoPath ? { ...photo, groupId } : photo,
-      ),
+  function getNextSortIndexForGroup(groupId: string, photoList: PhotoItem[]) {
+    return (
+      photoList
+        .filter((photo) => photo.groupId === groupId)
+        .reduce((maxValue, photo) => Math.max(maxValue, photo.sortIndex ?? -1), -1) + 1
     );
+  }
+
+  function assignPhotoByPathToGroup(photoPath: string, groupId: string | null) {
+    setPhotos((previous) => {
+      const nextSortIndex = groupId !== null ? getNextSortIndexForGroup(groupId, previous) : null;
+      return previous.map((photo) =>
+        photo.path === photoPath
+          ? { ...photo, groupId, sortIndex: groupId === null ? null : nextSortIndex }
+          : photo,
+      );
+    });
   }
 
   function togglePhotoStar(path: string) {
@@ -1749,6 +1920,74 @@ function App() {
     );
   }
 
+  function resetGroupPhotoDragState() {
+    setDraggingGroupPhotoPath(null);
+    setDragOverGroupPhotoPath(null);
+    setDragOverPosition(null);
+  }
+
+  function reorderVisiblePaths(
+    orderedPaths: string[],
+    draggingPath: string,
+    targetPath: string,
+    position: "before" | "after",
+  ) {
+    const withoutDragging = orderedPaths.filter((path) => path !== draggingPath);
+    const targetIndex = withoutDragging.indexOf(targetPath);
+    if (targetIndex === -1) {
+      return orderedPaths;
+    }
+
+    const insertIndex = position === "before" ? targetIndex : targetIndex + 1;
+    withoutDragging.splice(insertIndex, 0, draggingPath);
+    return withoutDragging;
+  }
+
+  async function persistCurrentGroupOrder(orderedPaths: string[]) {
+    if (!currentArtist || activeGroupId === "all" || activeGroupId === "unassigned") {
+      return;
+    }
+
+    const nextPaths = new Set(orderedPaths);
+    setPhotos((previous) =>
+      previous.map((photo) =>
+        photo.groupId === activeGroupId && nextPaths.has(photo.path)
+          ? { ...photo, sortIndex: orderedPaths.indexOf(photo.path) }
+          : photo,
+      ),
+    );
+
+    try {
+      const state = await invoke<FrontendState>("save_group_photo_order", {
+        photographerName: currentArtist,
+        groupId: activeGroupId,
+        orderedPhotoPaths: orderedPaths,
+      });
+      applyState(state);
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : String(error ?? "保存分组顺序失败"),
+      );
+      await refreshFromBackend();
+    }
+  }
+
+  function handleGroupPhotoPointerDown(
+    event: ReactPointerEvent<HTMLButtonElement>,
+    photoPath: string,
+  ) {
+    if (!canReorderGroupPhotos) {
+      return;
+    }
+    if (event.button !== 0) {
+      return;
+    }
+    reorderMovedRef.current = false;
+    setDraggingGroupPhotoPath(photoPath);
+    setDragOverGroupPhotoPath(photoPath);
+    setDragOverPosition("after");
+  }
+
   function openMoveDialog() {
     if (selectedGroupPhotoPaths.length === 0) {
       return;
@@ -1767,11 +2006,21 @@ function App() {
     similarSearchInputRef.current?.click();
   }
 
-  const runSimilarSearchWithFile = useCallback(async (file: File) => {
+  const runSimilarSearchWithPayload = useCallback(async ({
+    bytes,
+    name,
+    src,
+    mimeType,
+  }: {
+    bytes: number[];
+    name: string;
+    src: string;
+    mimeType: string;
+  }) => {
     const activeArtist = currentArtistRef.current;
     const artistPhotos = currentArtistPhotosRef.current;
 
-    if (!file || !activeArtist) {
+    if (bytes.length === 0 || !activeArtist) {
       if (!activeArtist) {
         setStatusMessage("请先选择一个摄影师，再粘贴或上传参考图");
       }
@@ -1782,18 +2031,18 @@ function App() {
       URL.revokeObjectURL(similarSearchReferenceSrc);
     }
 
-    const referenceSrc = URL.createObjectURL(file);
-    setSimilarSearchReferenceName(file.name || "剪贴板图片");
-    setSimilarSearchReferenceSrc(referenceSrc);
+    setSimilarSearchReferenceName(name || "剪贴板图片");
+    setSimilarSearchReferenceSrc(src);
+    setSimilarSearchReferencePayload({ bytes, mimeType });
+    setSimilarSearchImportGroupId("");
     setSimilarSearchLoading(true);
     setSimilarSearchLoadingMessage(TEXT.similarityCacheRefining);
     setSimilarSearchResults([]);
     setWorkspaceView("similar");
 
     try {
-      const buffer = await file.arrayBuffer();
       const response = await invoke<SimilarSearchResponse>("search_similar_photos", {
-        referenceBytes: Array.from(new Uint8Array(buffer)),
+        referenceBytes: bytes,
         photoPaths: artistPhotos.map((photo) => photo.path),
       });
       setSimilarSearchResults(response.results);
@@ -1813,6 +2062,16 @@ function App() {
       setSimilarSearchLoadingMessage(TEXT.similarSearchLoading);
     }
   }, [setStatusMessage, similarSearchReferenceSrc]);
+
+  const runSimilarSearchWithFile = useCallback(async (file: File) => {
+    const buffer = await file.arrayBuffer();
+    await runSimilarSearchWithPayload({
+      bytes: Array.from(new Uint8Array(buffer)),
+      name: file.name || "剪贴板图片",
+      src: URL.createObjectURL(file),
+      mimeType: file.type || "image/png",
+    });
+  }, [runSimilarSearchWithPayload]);
 
   async function handleSimilarSearchFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.currentTarget.files?.[0];
@@ -1861,6 +2120,54 @@ function App() {
   function openSimilaritySettingsDialog() {
     setSimilaritySettingsDraft(similaritySettings);
     setSimilaritySettingsOpen(true);
+  }
+
+  async function handleImportReferenceToLibrary() {
+    if (!currentArtist || !similarSearchReferencePayload || similarSearchImporting) {
+      return;
+    }
+
+    if (!similarSearchImportGroupId) {
+      setStatusMessage("请先选择要加入的分组");
+      return;
+    }
+
+    const targetGroupId = similarSearchImportGroupId === "unassigned" ? null : similarSearchImportGroupId;
+    const selectedGroupName =
+      targetGroupId === null
+        ? TEXT.ungrouped
+        : currentArtistGroups.find((group) => group.id === targetGroupId)?.name ?? TEXT.ungrouped;
+
+    try {
+      setSimilarSearchImporting(true);
+      setStatusMessage("正在加入图库...");
+      const state = await invoke<FrontendState>("import_reference_image", {
+        photographerName: currentArtist,
+        targetGroupId,
+        referenceBytes: similarSearchReferencePayload.bytes,
+        originalFileName: similarSearchReferenceName || "reference.png",
+        mimeType: similarSearchReferencePayload.mimeType,
+      });
+      applyState(state);
+
+      const refreshedPhotoPaths = state.photos
+        .filter((photo) => photo.photographerName === currentArtist)
+        .map((photo) => photo.path);
+
+      const response = await invoke<SimilarSearchResponse>("search_similar_photos", {
+        referenceBytes: similarSearchReferencePayload.bytes,
+        photoPaths: refreshedPhotoPaths,
+      });
+      setSimilarSearchResults(response.results);
+      setSimilarSearchImportGroupId("");
+      setStatusMessage(`已加入${selectedGroupName}，并刷新相似结果`);
+    } catch (error) {
+      setStatusMessage(
+        error instanceof Error ? error.message : String(error ?? "加入图库失败"),
+      );
+    } finally {
+      setSimilarSearchImporting(false);
+    }
   }
 
   function closeSimilaritySettingsDialog() {
@@ -1999,11 +2306,21 @@ function App() {
     }
 
     const selectedSet = new Set(selectedGroupPhotoPaths);
-    setPhotos((previous) =>
-      previous.map((photo) =>
-        selectedSet.has(photo.path) ? { ...photo, groupId: targetGroupId } : photo,
-      ),
-    );
+    setPhotos((previous) => {
+      let nextSortIndex =
+        targetGroupId !== null ? getNextSortIndexForGroup(targetGroupId, previous) : -1;
+      return previous.map((photo) => {
+        if (!selectedSet.has(photo.path)) {
+          return photo;
+        }
+        if (targetGroupId === null) {
+          return { ...photo, groupId: null, sortIndex: null };
+        }
+        const movedPhoto = { ...photo, groupId: targetGroupId, sortIndex: nextSortIndex };
+        nextSortIndex += 1;
+        return movedPhoto;
+      });
+    });
     setSelectedGroupPhotoPaths([]);
     closeMoveDialog();
   }
@@ -2716,10 +3033,31 @@ function App() {
                       <button
                         key={photo.path}
                         type="button"
+                        data-photo-path={photo.path}
                         className={`group-browser-thumb ${
                           selectedGroupPhotoPaths.includes(photo.path) ? "selected" : ""
+                        } ${canReorderGroupPhotos ? "reorderable" : ""} ${
+                          draggingGroupPhotoPath && draggingGroupPhotoPath !== photo.path
+                            ? "reorder-targeting"
+                            : ""
+                        } ${draggingGroupPhotoPath === photo.path ? "dragging" : ""} ${
+                          dragOverGroupPhotoPath === photo.path && dragOverPosition === "before"
+                            ? "drag-over-before"
+                            : ""
+                        } ${
+                          dragOverGroupPhotoPath === photo.path && dragOverPosition === "after"
+                            ? "drag-over-after"
+                            : ""
                         }`}
-                        onClick={() => toggleGroupPhotoSelection(photo.path)}
+                        onPointerDown={(event) => handleGroupPhotoPointerDown(event, photo.path)}
+                        onDragStart={(event) => event.preventDefault()}
+                        onClick={() => {
+                          if (suppressGroupClickRef.current) {
+                            suppressGroupClickRef.current = false;
+                            return;
+                          }
+                          toggleGroupPhotoSelection(photo.path);
+                        }}
                         onDoubleClick={() => {
                           setSelectedPhotoPath(photo.path);
                           setWorkspaceView("detail");
@@ -2744,7 +3082,7 @@ function App() {
                             selectedGroupPhotoPaths.includes(photo.path) ? "checked" : ""
                           }`}
                         />
-                        <img src={photo.previewSrc} alt={photo.name} />
+                        <img src={photo.previewSrc} alt={photo.name} draggable={false} />
                       </button>
                     ))}
                   </div>
@@ -3041,6 +3379,43 @@ function App() {
                         <strong>{similarSearchReferenceName || "参考图"}</strong>
                         <span>{currentArtist ? `在 ${currentArtist} 的图库中查找 Top 10` : "未选择摄影师"}</span>
                       </div>
+                      {currentArtist ? (
+                        <div className="similar-reference-import-panel">
+                          <div className="similar-reference-import-copy">
+                            <strong>没有相似的照片？试试看加入图库吧</strong>
+                            <span>选择一个分组后，这张参考图会直接加入当前摄影师图库。</span>
+                          </div>
+                          <div className="similar-reference-import-groups">
+                            <button
+                              type="button"
+                              className={`tag-chip ${similarSearchImportGroupId === "unassigned" ? "active" : ""}`}
+                              onClick={() => setSimilarSearchImportGroupId("unassigned")}
+                            >
+                              {TEXT.ungrouped}
+                            </button>
+                            {currentArtistGroups.map((group) => (
+                              <button
+                                key={`similar-import-${group.id}`}
+                                type="button"
+                                className={`tag-chip ${similarSearchImportGroupId === group.id ? "active" : ""}`}
+                                onClick={() => setSimilarSearchImportGroupId(group.id)}
+                              >
+                                {group.name}
+                              </button>
+                            ))}
+                          </div>
+                          <div className="similar-reference-import-actions">
+                            <button
+                              type="button"
+                              className="move-group-button export-group-button"
+                              onClick={handleImportReferenceToLibrary}
+                              disabled={similarSearchImporting || !similarSearchImportGroupId}
+                            >
+                              {similarSearchImporting ? "正在加入..." : "确定"}
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
                   ) : (
                     <div className="info-empty">{TEXT.similarSearchEmpty}</div>

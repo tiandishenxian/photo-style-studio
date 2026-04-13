@@ -907,6 +907,46 @@ button {
   line-height: 1.6;
 }
 
+.similar-reference-import-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #ececf5;
+  border-radius: 18px;
+  background: #fbfbff;
+}
+
+.similar-reference-import-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.similar-reference-import-copy strong {
+  color: #2a2d43;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1.5;
+}
+
+.similar-reference-import-copy span {
+  color: #8a8ea4;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.similar-reference-import-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.similar-reference-import-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .group-browser-thumb {
   width: 100%;
   aspect-ratio: 1;
@@ -917,6 +957,16 @@ button {
   background: #f8f8fb;
   cursor: pointer;
   transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+}
+
+.group-browser-thumb.reorderable {
+  cursor: grab;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.group-browser-thumb.reorder-targeting {
+  transition: border-color 80ms ease, box-shadow 80ms ease;
 }
 
 .group-browser-thumb img {
@@ -935,6 +985,32 @@ button {
 .group-browser-thumb.selected {
   border-color: #5b4cf0;
   box-shadow: 0 0 0 2px rgba(91, 76, 240, 0.12);
+}
+
+.group-browser-thumb.dragging {
+  opacity: 0.72;
+  cursor: grabbing;
+}
+
+.group-browser-thumb.drag-over-before::before,
+.group-browser-thumb.drag-over-after::after {
+  content: "";
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  height: 4px;
+  border-radius: 999px;
+  background: #5b4cf0;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.92);
+  z-index: 3;
+}
+
+.group-browser-thumb.drag-over-before::before {
+  top: 8px;
+}
+
+.group-browser-thumb.drag-over-after::after {
+  bottom: 8px;
 }
 
 .photo-star-button {
